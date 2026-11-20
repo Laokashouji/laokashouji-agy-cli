@@ -2122,7 +2122,7 @@ class Proc {
     // scope (#1229)
     this.home = currentHome()
     this.#assign(convKey, opts)
-    this.workDir = opts.workDir
+    this.workDir = this.resumeFrom && "workDir" in this.resumeFrom ? this.resumeFrom.workDir : opts.workDir
     this.spareKey = null
     this.token = randomUUID()
     this.sessionId = null
@@ -3489,12 +3489,13 @@ function takeParked(convKey, opts) {
   parked.delete(convKey)
   unparked.add(convKey)
   saveParked()
-  if (Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
+  if (Date.now() - entry.at > RESUME_TTL_MS ||
     entry.instructionsHash !== digest(sentInstructionsIdentity(opts.instructions)) ||
     entry.userCloak !== USER_CLOAK || entry.instructionsInSession !== (systemAppend() && !!opts.instructions)) return null
   const incoming = digest(historyKey(opts.history))
   const workspace = resumeWorkspace(entry.workspace)
-  if (entry.historyHash === incoming) return { sessionId: entry.sessionId, expectedMessages: opts.history, workspace }
+  const workDir = entry.workDir == null ? null : (workDirectory(entry.workDir) ?? opts.workDir ?? null)
+  if (entry.historyHash === incoming) return { sessionId: entry.sessionId, expectedMessages: opts.history, workspace, workDir }
   // Sans-inputs resume needs the hashes written by current park(). Old
   // entries without them still resume on an exact historyHash match only.
   const incomingSans = digest(historyKey(stripToolUseInputs(opts.history)))
@@ -3502,7 +3503,7 @@ function takeParked(convKey, opts) {
   const idsOk = incomingIds != null && entry.toolUseIdentitiesHash === digest(incomingIds)
   const sansOk = entry.historyHashSansInputs === incomingSans || entry.historyHash === incomingSans
   if (!idsOk || !sansOk) return null
-  return { sessionId: entry.sessionId, expectedMessages: opts.history, workspace }
+  return { sessionId: entry.sessionId, expectedMessages: opts.history, workspace, workDir }
 }
 
 async function retire(key, proc) {
@@ -3791,8 +3792,9 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     // the prompt budget, and summarizes what is left of it.
     const compactionFork = !forceNew && !!opts.compaction && !existing.dead && !existing.retiring &&
       !existing.matchesHistory(matchedHistory) && existing.continuesPast(matchedHistory)
+    const workDirCompatible = existing.hasSentFirstTurn || existing.workDir === opts.workDir
     const compatible = !forceNew && !existing.dead && !existing.retiring &&
-      existing.workDir === opts.workDir && sameInstructions(existing.instructions, opts.instructions) &&
+      workDirCompatible && sameInstructions(existing.instructions, opts.instructions) &&
       (existing.matchesHistory(matchedHistory) || continuedFresh || compactionFork || compacted)
     if (compatible && (!(isFreshConversation && existing.hasSentFirstTurn) || continuedFresh || compacted)) {
       if (continuedFresh) {
@@ -3819,7 +3821,7 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       why = "tools_unlisted"
     } else {
       why = forceNew ? "forced" : existing.dead ? "dead" : existing.retiring ? "retiring" :
-        existing.workDir !== opts.workDir ? "work_dir" :
+        !workDirCompatible ? "work_dir" :
         !sameInstructions(existing.instructions, opts.instructions) ? "instructions" :
         !(existing.matchesHistory(matchedHistory) || continuedFresh) ? "history" : "fresh_after_first"
     }
@@ -3828,8 +3830,9 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     await existing.stop().catch(() => {})
   }
   const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
+  const launchWorkDir = resume && "workDir" in resume ? resume.workDir : opts.workDir
   // a spare runs in a folder of its own, and a resumed session needs its own
-  const spare = resume?.workspace ? null : await takeSpare(agyPath, opts.workDir)
+  const spare = resume?.workspace ? null : await takeSpare(agyPath, launchWorkDir)
   while (!spare && allProcs.size >= maxProcs()) {
     const idle = spares.values().next().value
     if (idle) {
@@ -4083,8 +4086,7 @@ function replayHistoryProblem(body, resultBlocks) {
 // the client's history, ready for its next message. False when the session
 // can't take it as it is; the caller then replays, as for a fork.
 async function keepDroppedTurn(proc, turn, opts) {
-  if (proc.toolsGrew(opts.tools) || proc.workDir !== opts.workDir ||
-    !sameInstructions(proc.instructions, opts.instructions)) return false
+  if (proc.toolsGrew(opts.tools) || !sameInstructions(proc.instructions, opts.instructions)) return false
   const results = turn.calls.filter((call) => call.id && !call.result && !call.mcpResponded).map((call) => ({
     block: { tool_use_id: call.id },
     call,
@@ -4300,10 +4302,19 @@ function stripAgentClockLines(text) {
   return s.split(/(\n)/).map((part) => (part === "\n" || !isAgentClockLine(part) ? part : "")).join("")
 }
 
-// System prompt and session instructions: billing headers plus known agent
-// clock lines. User text is never passed through this helper.
+const WORK_DIR_NOTE_RE = /^The caller's working directory is "(?:[^"\\]|\\.)*"\. The environment the caller describes \(working directory, platform, OS, shell, git status\) is where every tool runs\. The bridge's temporary workspace only holds its agent configuration; use the caller's environment for tool paths and commands\.$/
+
+function stripWorkDirNote(text) {
+  const s = String(text ?? "")
+  if (!s) return s
+  return s.split(/(\n)/).map((part) => (part === "\n" || !WORK_DIR_NOTE_RE.test(part) ? part : "")).join("")
+}
+
+// System prompt and session instructions: billing headers, known agent
+// clock lines, and the bridge's own work-dir note (which changes when the
+// caller cds mid-session). User text is never passed through this helper.
 function stripVolatileSystem(text) {
-  return stripAgentClockLines(stripBillingHeader(text))
+  return stripWorkDirNote(stripAgentClockLines(stripBillingHeader(text)))
 }
 
 function instructionsIdentity(text) {
@@ -4594,7 +4605,7 @@ function findRemaskedProc(convKey, opts) {
     if (proc.convKey === convKey || /^(.*?)[0-9a-f]{64}$/.exec(proc.convKey)?.[1] !== account) continue
     if ((proc.userId || "") !== (opts.userId || "")) continue
     if ((proc.sessionScope || "") !== (opts.sessionScope || "")) continue
-    if (proc.workDir !== opts.workDir || !sameInstructions(proc.instructions, opts.instructions)) continue
+    if (!sameInstructions(proc.instructions, opts.instructions)) continue
     const expectedFirst = Array.isArray(proc.expectedMessages) ? proc.expectedMessages[0] : null
     if (!expectedFirst || !sameUpToMaskedValues(historyKey([expectedFirst]), firstKey)) continue
     if (!proc.matchesHistory(history)) continue
@@ -4617,7 +4628,6 @@ function findLiveContinuedProc(opts) {
     if (proc.dead || proc.retiring || proc.turn) continue
     if ((proc.userId || "") !== userId) continue
     if ((proc.sessionScope || "") !== sessionScope) continue
-    if (proc.workDir !== opts.workDir) continue
     if (!sameInstructions(proc.instructions, opts.instructions)) continue
     if (!proc.hasSentFirstTurn) continue
     if (!isContinuedOpening(proc, first)) continue
@@ -4648,7 +4658,7 @@ function findCompactedProc(convKey, opts) {
     if (proc.convKey === convKey) continue
     if ((proc.userId || "") !== (opts.userId || "")) continue
     if ((proc.sessionScope || "") !== (opts.sessionScope || "")) continue
-    if (proc.workDir !== opts.workDir || !sameInstructions(proc.instructions, opts.instructions)) continue
+    if (!sameInstructions(proc.instructions, opts.instructions)) continue
     // Kept once already and agy has not compacted its window since: Claude
     // Code would find it as full as before and compact again, turn after turn.
     if (proc.keptCompactionContext != null &&
@@ -7373,7 +7383,7 @@ export const AntigravityBridgePlugin = async () => {
                   // A steer keeps the live session, so agy's prompt cache holds: the
                   // calls are answered with their real results, the step is
                   // cancelled, and the steer goes in as the next prompt.
-                  if ((interrupted || imageResult) && historyMatches && !proc.toolsGrew(tools) && proc.workDir === workDir &&
+                  if ((interrupted || imageResult) && historyMatches && !proc.toolsGrew(tools) &&
                     sameInstructions(proc.instructions, instructions) &&
                     await proc.steerInSession(turn, rawResults, trailingMessages(body).history)) {
                     keptSession = true
@@ -7383,7 +7393,7 @@ export const AntigravityBridgePlugin = async () => {
                         .map((item) => item.block.tool_use_id),
                     )
                   } else if (interrupted || imageResult || !historyMatches || proc.toolsGrew(tools) ||
-                    proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
+                    !sameInstructions(proc.instructions, instructions)) {
                     // A changed context, a tool catalog that grew, or a
                     // user-interrupted tool turn needs a new session. Replay the
                     // real results without resolving the old process's calls.
@@ -7391,7 +7401,6 @@ export const AntigravityBridgePlugin = async () => {
                       : imageResult ? "image_result"
                       : !historyMatches ? "history_mismatch"
                       : proc.toolsGrew(tools) ? "tools_grew"
-                      : proc.workDir !== workDir ? "work_dir"
                       : "instructions"
                     logBridgeEvent(proc, turn, "drop_live", dropReason, acquireOpts, {
                       history: trailingMessages(body).history.length,
