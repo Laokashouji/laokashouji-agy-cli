@@ -8,6 +8,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import crypto from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
 import {
@@ -301,3 +302,109 @@ test("two separate fresh conversations with different x-magpie-work-dir still ge
     assert.equal(addDirOf(kit.acpSpawns[1]), path.resolve(dirB))
   })
 })
+
+function legacyInstructionsHash(system, workDir) {
+  const note = `The caller's working directory is ${JSON.stringify(workDir)}. The environment the caller describes (working directory, platform, OS, shell, git status) is where every tool runs. The bridge's temporary workspace only holds its agent configuration; use the caller's environment for tool paths and commands.`
+  const combined = system.trim() ? `${system}\n\n${note}` : note
+  return crypto.createHash("sha256").update(combined.replace(/\s+/g, "")).digest("hex")
+}
+
+test("legacy parked session hashed with workDirNote still resumes after upgrade", async () => {
+  await withKit({ sessionResume: true }, async (kit1) => {
+    const dirA = makeDir(kit1, "legacy-a")
+    const dirB = makeDir(kit1, "legacy-b")
+    const stateFile = path.join(kit1.tmp, "legacy-sessions.json")
+    const system = "You are a helpful coding assistant."
+    const msgA1 = [{ role: "user", content: "legacy conversation start" }]
+    let sessionA = null
+    let workspaceA = null
+
+    await withKit({ env: { AGY_BRIDGE_STATE_FILE: stateFile }, sessionResume: true }, async (oldHost) => {
+      oldHost.prompts.push(async (agent) => {
+        sessionA = agent.sessionId
+        await agent.text("reply A1")
+        return { stopReason: "end_turn", usage: USAGE }
+      })
+      await readSse(await oldHost.request(baseBody({ system, messages: msgA1 }), dirHeaders(dirA)))
+      assert.ok(sessionA)
+      workspaceA = oldHost.acpSpawns[0].cwd
+    })
+
+    // Start a fresh host instance reading the legacy sessions.json from disk
+    await withKit({ env: { AGY_BRIDGE_STATE_FILE: stateFile }, sessionResume: true }, async (newHost) => {
+      // Rewrite parked entry's instructionsHash to the pre-stripWorkDirNote hash
+      // (and place its workspace under newHost.tmp since testkit isolates os.tmpdir() per kit)
+      const expectedWorkspace = path.join(newHost.tmp, path.basename(workspaceA))
+      const state = JSON.parse(fs.readFileSync(stateFile, "utf8"))
+      const entryA = state.entries.find((e) => e.sessionId === sessionA)
+      assert.ok(entryA)
+      const newHash = entryA.instructionsHash
+      entryA.instructionsHash = legacyInstructionsHash(system, path.resolve(dirA))
+      entryA.workspace = expectedWorkspace
+      assert.notEqual(entryA.instructionsHash, newHash, "legacy hash must differ from stripped hash")
+      fs.writeFileSync(stateFile, JSON.stringify(state))
+
+      newHost.prompts.push(async (agent) => {
+        await agent.text("reply A2")
+        return { stopReason: "end_turn", usage: USAGE }
+      })
+
+      const msgA2 = [
+        ...msgA1,
+        { role: "assistant", content: [{ type: "text", text: "reply A1" }] },
+        { role: "user", content: "continue after plugin upgrade" },
+      ]
+      const resumedRes = await readSse(await newHost.request(baseBody({ system, messages: msgA2 }), dirHeaders(dirB)))
+      assert.equal(resumedRes.stopReason, "end_turn")
+
+      const resumes = newHost.acpLog.filter((item) => item.method === "session/resume")
+      assert.equal(resumes.length, 1, "must resume legacy parked session instead of rebuilding")
+      assert.equal(resumes[0].params.sessionId, sessionA)
+      assert.equal(newHost.acpSpawns[0].cwd, expectedWorkspace)
+      assert.equal(addDirOf(newHost.acpSpawns[0]), path.resolve(dirA))
+    })
+  })
+})
+
+test("legacy parked session still rejects resume when real system prompt changed", async () => {
+  await withKit({ sessionResume: true }, async (kit1) => {
+    const dirA = makeDir(kit1, "legacy-sys-a")
+    const stateFile = path.join(kit1.tmp, "legacy-sys-sessions.json")
+    const msgA1 = [{ role: "user", content: "legacy sys start" }]
+    let sessionA = null
+
+    await withKit({ env: { AGY_BRIDGE_STATE_FILE: stateFile }, sessionResume: true }, async (oldHost) => {
+      oldHost.prompts.push(async (agent) => {
+        sessionA = agent.sessionId
+        await agent.text("reply A1")
+        return { stopReason: "end_turn", usage: USAGE }
+      })
+      await readSse(await oldHost.request(baseBody({ system: "Rule v1.", messages: msgA1 }), dirHeaders(dirA)))
+      assert.ok(sessionA)
+    })
+
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8"))
+    const entryA = state.entries.find((e) => e.sessionId === sessionA)
+    assert.ok(entryA)
+    entryA.instructionsHash = legacyInstructionsHash("Rule v1.", path.resolve(dirA))
+    fs.writeFileSync(stateFile, JSON.stringify(state))
+
+    await withKit({ env: { AGY_BRIDGE_STATE_FILE: stateFile }, sessionResume: true }, async (newHost) => {
+      newHost.prompts.push(async (agent) => {
+        await agent.text("reply A2 fresh")
+        return { stopReason: "end_turn", usage: USAGE }
+      })
+      const msgA2 = [
+        ...msgA1,
+        { role: "assistant", content: [{ type: "text", text: "reply A1" }] },
+        { role: "user", content: "continue with different system prompt" },
+      ]
+      const res = await readSse(await newHost.request(baseBody({ system: "Rule v2.", messages: msgA2 }), dirHeaders(dirA)))
+      assert.equal(res.stopReason, "end_turn")
+
+      const resumes = newHost.acpLog.filter((item) => item.method === "session/resume")
+      assert.equal(resumes.length, 0, "genuine system prompt change must not resume legacy parked session")
+    })
+  })
+})
+

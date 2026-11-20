@@ -3482,6 +3482,12 @@ function resumeWorkspace(workspace) {
   return /^magpie-agy-bridge-[A-Za-z0-9]{6}$/.test(path.basename(resolved)) ? resolved : null
 }
 
+function parkedInstructionsMatch(entry, instructions) {
+  if (entry.instructionsHash === digest(sentInstructionsIdentity(instructions))) return true
+  if (!entry.workDir) return false
+  return entry.instructionsHash === digest(sentInstructionsIdentityWithWorkDir(instructions, entry.workDir))
+}
+
 function takeParked(convKey, opts) {
   loadParked()
   const entry = parked.get(convKey)
@@ -3490,7 +3496,7 @@ function takeParked(convKey, opts) {
   unparked.add(convKey)
   saveParked()
   if (Date.now() - entry.at > RESUME_TTL_MS ||
-    entry.instructionsHash !== digest(sentInstructionsIdentity(opts.instructions)) ||
+    !parkedInstructionsMatch(entry, opts.instructions) ||
     entry.userCloak !== USER_CLOAK || entry.instructionsInSession !== (systemAppend() && !!opts.instructions)) return null
   const incoming = digest(historyKey(opts.history))
   const workspace = resumeWorkspace(entry.workspace)
@@ -4341,6 +4347,19 @@ const USER_CLOAK = 1
 
 function sentInstructionsIdentity(text) {
   return compactIdentity(outgoing(stripVolatileSystem(text)))
+}
+
+// Legacy parked entries (written before stripWorkDirNote was added to
+// stripVolatileSystem) hashed instructions with workDirNote(entry.workDir)
+// intact. Accepting that hash on resume avoids rebuilding compatible sessions
+// across the upgrade while still rejecting system prompt or outgoing() changes.
+function sentInstructionsIdentityWithWorkDir(text, workDir) {
+  const base = stripVolatileSystem(text)
+  if (!workDir) return compactIdentity(outgoing(base))
+  const parts = []
+  if (base.trim()) parts.push(base)
+  parts.push(workDirNote(workDir))
+  return compactIdentity(outgoing(parts.join("\n\n")))
 }
 
 // Message text used for conversation/history identity: billing header lines,
