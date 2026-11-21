@@ -24,6 +24,7 @@ import { cloakUser, hint, outgoing, turnsAway } from "./cloak.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 
 const PROVIDER_ID = "agy-cli"
+const PROVIDER_NAME = "Antigravity (local agy CLI)"
 // Client tools reach the session through a private `nc` placed first on agy's
 // PATH: agy dials `--ide-mcp-port` by running `nc 127.0.0.1 <port>`. That is
 // how agy works, not a documented interface, and it was checked on 1.4.12 and
@@ -7671,6 +7672,17 @@ export const AntigravityBridgePlugin = async () => {
           }),
         }
       },
+    },
+    // The provider's name, which magpie shows on its Providers row and
+    // OpenCode in its model picker: with none, both fell back to the id
+    // (agy-cli). The same name as the plugin's row in registry.json, and
+    // the package its models are spoken to with, as provider.npm says. A
+    // name or package the user gave the provider in their own config is
+    // kept. The models come from provider.models.
+    config: async (cfg) => {
+      cfg.provider ??= {}
+      const was = cfg.provider[PROVIDER_ID] ?? {}
+      cfg.provider[PROVIDER_ID] = { npm: NPM_ANTHROPIC, ...was, name: was.name || PROVIDER_NAME }
     },
     provider: {
       id: PROVIDER_ID,
