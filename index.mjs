@@ -5797,15 +5797,27 @@ function utf8Prefix(text, bytes) {
 function clipMiddle(text, limit, keep = Math.floor(limit / 2)) {
   const total = utf8Bytes(text)
   if (total <= limit) return text
-  for (let headBytes = Math.min(keep, limit), tries = 0; tries < 8; tries++) {
+  if (limit <= 0) return ""
+  const maxMarker = utf8Bytes(`\n[... ${total} bytes omitted ...]\n`)
+  if (limit <= maxMarker) return utf8Prefix(text, limit)
+  let usable = limit - maxMarker
+  for (let tries = 0; tries < 12; tries++) {
+    const headBytes = Math.min(keep, Math.floor(usable / 2))
+    const tailBudget = Math.min(keep, Math.max(0, usable - headBytes))
     const head = utf8Prefix(text, headBytes)
-    const tailStart = utf8Prefix(text, total - Math.max(0, Math.min(keep, limit - headBytes))).length
+    const tailStart = utf8Prefix(text, Math.max(0, total - tailBudget)).length
     const tail = text.slice(Math.max(tailStart, head.length))
-    const marker = `\n[... ${total - utf8Bytes(head) - utf8Bytes(tail)} bytes omitted ...]\n`
-    const clipped = head + marker + tail
-    if (utf8Bytes(clipped) <= limit) return clipped
-    keep = Math.floor(keep * 0.75)
-    headBytes = Math.min(keep, limit)
+    const omitted = total - utf8Bytes(head) - utf8Bytes(tail)
+    if (omitted > 0) {
+      const marker = `\n[... ${omitted} bytes omitted ...]\n`
+      const clipped = head + marker + tail
+      const clippedBytes = utf8Bytes(clipped)
+      if (clippedBytes <= limit) return clipped
+      usable = Math.max(0, usable - Math.max(clippedBytes - limit, 4))
+    } else {
+      usable = Math.max(0, usable - 8)
+    }
+    if (usable === 0) break
   }
   return utf8Prefix(text, limit)
 }
@@ -5830,7 +5842,7 @@ function headTail(text) {
 // of a long paste, and tool output gives way first (plugins#1401).
 function clipHistoryMessage(message, userLimit = HISTORY_BLOCK_CLIP_BYTES) {
   const clipText = (text) => message.role === "user" && userLimit > HISTORY_BLOCK_CLIP_BYTES && !isMetaOnlyUserText(text)
-    ? clipMiddle(text, userLimit)
+    ? clipPartsToBytes([{ type: "text", text }], userLimit)[0].text
     : clipHistoryText(text)
   if (typeof message.content === "string") return { ...message, content: clipText(message.content) }
   if (!Array.isArray(message.content)) return message
@@ -5867,19 +5879,128 @@ function renderHistoryEntry(message) {
   return out
 }
 
-// Shrinks the largest text parts (head and tail kept) until the text fits `limit`.
+function splitSystemReminderSegments(text) {
+  const s = String(text ?? "")
+  if (!s) return []
+  const open = "<system-reminder"
+  const close = "</system-reminder>"
+  const lower = asciiLower(s)
+  const segments = []
+  const pushContent = (chunk) => {
+    if (!chunk) return
+    const prev = segments.at(-1)
+    if (prev && !prev.reminder) prev.text += chunk
+    else segments.push({ reminder: false, text: chunk })
+  }
+  let i = 0
+  while (i < s.length) {
+    const start = lower.indexOf(open, i)
+    if (start === -1) {
+      pushContent(s.slice(i))
+      break
+    }
+    const afterName = start + open.length
+    if (afterName < s.length && /[A-Za-z0-9_]/.test(s[afterName])) {
+      pushContent(s.slice(i, afterName))
+      i = afterName
+      continue
+    }
+    const gt = s.indexOf(">", afterName)
+    if (gt === -1) {
+      pushContent(s.slice(i))
+      break
+    }
+    const closeAt = lower.indexOf(close, gt + 1)
+    if (closeAt === -1) {
+      pushContent(s.slice(i))
+      break
+    }
+    if (start > i) pushContent(s.slice(i, start))
+    const end = closeAt + close.length
+    segments.push({
+      reminder: true,
+      open: s.slice(start, gt + 1),
+      inner: s.slice(gt + 1, closeAt),
+      close: s.slice(closeAt, end),
+    })
+    i = end
+  }
+  return segments
+}
+
+function waterFillCap(sizes, excess) {
+  if (excess <= 0 || !sizes.length) return Infinity
+  const sorted = [...sizes].sort((a, b) => b - a)
+  let remaining = excess
+  for (let i = 0; i < sorted.length; i++) {
+    const next = i + 1 < sorted.length ? sorted[i + 1] : 0
+    const drop = (sorted[i] - next) * (i + 1)
+    if (drop >= remaining) return Math.max(0, sorted[i] - Math.ceil(remaining / (i + 1)))
+    remaining -= drop
+  }
+  return 0
+}
+
+// Shrinks <system-reminder> blocks first so user text sandwiched between
+// large reminders survives budget clipping intact, then clips content if needed.
 function clipPartsToBytes(parts, limit) {
   const out = parts.map((part) => ({ ...part }))
-  for (let guard = 0; guard < 64; guard++) {
-    const excess = promptTextBytes(out) - limit
-    if (excess <= 0) break
-    let largest = null
-    for (const part of out) {
-      if (part.type === "text" && (!largest || utf8Bytes(part.text) > utf8Bytes(largest.text))) largest = part
+  if (promptTextBytes(out) <= limit) return out
+  if (limit <= 0) {
+    for (const part of out) if (part.type === "text") part.text = ""
+    return out
+  }
+  const segmented = out.map((part) => (part.type === "text" ? splitSystemReminderSegments(part.text) : null))
+  const reminders = []
+  const contents = []
+  for (const segs of segmented) {
+    if (!segs) continue
+    for (const seg of segs) (seg.reminder ? reminders : contents).push(seg)
+  }
+  const segBytes = (seg) => seg.reminder
+    ? utf8Bytes(seg.open) + utf8Bytes(seg.inner) + utf8Bytes(seg.close)
+    : utf8Bytes(seg.text)
+  const totalReminderBytes = () => reminders.reduce((sum, seg) => sum + segBytes(seg), 0)
+  const totalContentBytes = () => contents.reduce((sum, seg) => sum + segBytes(seg), 0)
+
+  if (reminders.length) {
+    const remTotal = totalReminderBytes()
+    const contentBytes = totalContentBytes()
+    const reminderBudget = contentBytes > limit
+      ? Math.min(remTotal, Math.floor(limit / 4))
+      : remTotal <= Math.floor(limit / 8) && contentBytes > Math.floor((limit * 3) / 4)
+        ? remTotal
+        : limit - contentBytes
+    const excess = remTotal - reminderBudget
+    if (excess > 0) {
+      const cap = waterFillCap(reminders.map((seg) => utf8Bytes(seg.inner)), excess)
+      for (const seg of reminders) {
+        if (utf8Bytes(seg.inner) > cap) seg.inner = clipMiddle(seg.inner, cap)
+      }
+      if (totalReminderBytes() > reminderBudget) {
+        let dropExcess = totalReminderBytes() - reminderBudget
+        for (const seg of [...reminders].sort((a, b) => segBytes(b) - segBytes(a))) {
+          if (dropExcess <= 0) break
+          dropExcess -= segBytes(seg)
+          seg.open = ""
+          seg.inner = ""
+          seg.close = ""
+        }
+      }
     }
-    if (!largest) break
-    const size = utf8Bytes(largest.text)
-    largest.text = clipMiddle(largest.text, Math.max(0, size - excess))
+  }
+
+  const contentExcess = totalContentBytes() - Math.max(0, limit - totalReminderBytes())
+  if (contentExcess > 0 && contents.length) {
+    const cap = waterFillCap(contents.map((seg) => utf8Bytes(seg.text)), contentExcess)
+    for (const seg of contents) {
+      if (utf8Bytes(seg.text) > cap) seg.text = clipMiddle(seg.text, cap)
+    }
+  }
+
+  for (let i = 0; i < out.length; i++) {
+    if (!segmented[i]) continue
+    out[i].text = segmented[i].map((seg) => (seg.reminder ? seg.open + seg.inner + seg.close : seg.text)).join("")
   }
   return out
 }
