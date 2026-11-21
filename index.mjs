@@ -2618,9 +2618,8 @@ class Proc {
     if (this.historyInvalid || this.turn || !Array.isArray(this.expectedMessages) || !Array.isArray(messages)) return false
     const k = messages.length
     if (!k || k >= this.expectedMessages.length || this.expectedMessages[k].role !== "user") return false
-    const expectedKey = historyKey(this.expectedMessages.slice(0, k))
-    const actualKey = historyKey(messages)
-    return expectedKey === actualKey || sameUpToMaskedValues(expectedKey, actualKey)
+    const prefix = this.expectedMessages.slice(0, k)
+    return historyKey(prefix) === historyKey(messages) || sameHistoryUpToMasking(prefix, messages)
   }
 
   // Clients such as Claude Code normalize tool_use inputs when recording an
