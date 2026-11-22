@@ -1757,6 +1757,12 @@ class Turn {
     }
     if ((step.usageKind === "exact" || step.usageKind === "agy_model_call") && total > 0 && estimate > 0) {
       this.proc.contextAnchor = { tokens: total, estimate }
+    } else if (final && calibrate && total > 0 && estimate > 0 && this.proc.contextAnchor &&
+      estimate >= this.proc.contextAnchor.estimate && total < this.proc.contextAnchor.tokens * 0.8) {
+      // Fallback final responses still receive ACP's real total. When agy
+      // compacted its context while step metering was offline, drop the stale
+      // pre-compaction anchor so later tool-step estimates don't stay inflated.
+      this.proc.contextAnchor = { tokens: total, estimate }
     }
   }
 
@@ -2141,6 +2147,8 @@ class Proc {
     this.keptCompactionContext = null
     this.compactedContinuation = false
     this.stepUsageTrusted = true
+    this.stepUsageMeasured = false
+    this.stepUsageMissTurns = 0
     this.configOptions = []
     this.configMethodUnsupported = false
     this.currentSelectionKey = null
@@ -2703,7 +2711,7 @@ class Proc {
         ? sessionDbPath(this.sessionId, this.conversationsDir ? { AGY_BRIDGE_CONVERSATIONS_DIR: this.conversationsDir } : process.env)
         : null
       turn.stepCursor = turn.stepsFile ? modelUsageCursor(turn.stepsFile) : null
-      if (turn.stepsFile && turn.stepCursor === null) this.stepUsageTrusted = false
+      if (turn.stepsFile && turn.stepCursor === null && !this.stepUsageMeasured) this.stepUsageTrusted = false
       // Content a cancelled turn never delivered still belongs to the session.
       let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
       this.unsentPrompt = null
@@ -3068,7 +3076,11 @@ class Proc {
     turn.cancelledMcpSockets.clear()
     turn.steering = false
     if (turn.stepsFile && turn.promptCount > 0 && !turn.stepUsageReconciled) {
-      this.stepUsageTrusted = false
+      if (turn.cancelRequested || !this.stepUsageMeasured) {
+        this.stepUsageTrusted = false
+      } else if (!(turn.measured?.prompt > 0)) {
+        if (++this.stepUsageMissTurns >= 2) this.stepUsageTrusted = false
+      }
     }
     turn.detach()
     clearTimeout(turn.timer)
@@ -7102,8 +7114,12 @@ async function measuredUsage(turn, step, content, result) {
   if (!batch) return null
   const steps = batch.steps
   if (!complete(steps)) {
+    // After waiting waitMs (75ms without new text/thinking, 1000ms with it),
+    // no new row and no pending pre-send row on a turn that already measured a
+    // generation means this tool step drained buffered output from an already-
+    // accounted generation (e.g. tool -> text -> tool or self-poll batch).
     if (!batch.pending && !steps?.length && (
-      canShareGeneration ||
+      (!final && measured.prompt > 0 && turn.stepCursor.source !== null) ||
       (final && expected !== null && measured.prompt > 0 &&
         measured.prompt >= expected &&
         measured.prompt <= expected + Math.max(16, Math.ceil(expected * 0.01)))
@@ -7126,7 +7142,12 @@ async function measuredUsage(turn, step, content, result) {
         output_tokens: 0,
       }
     }
-    return null
+    // After waiting the full STEP_USAGE_WAIT_MS on end_turn with no pending row,
+    // completed store rows whose sum is still below ACP's total (e.g. agy ran an
+    // internal compaction summarizer included in ACP usage but absent from
+    // gen_metadata) are still valid per-call measurements; upper-bound check below
+    // continues to reject over-counts.
+    if (!(final && !batch.pending && steps?.length > 0)) return null
   }
   // agy's per-call prompts sum to ACP's total exactly. A large over-count means
   // the store's layout or contents no longer match what ACP reported, so don't
@@ -7139,6 +7160,8 @@ async function measuredUsage(turn, step, content, result) {
   const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
   turn.stepCursor = { source: batch.source, idx: last.idx }
   turn.measured = { prompt, context: last.input + last.read + last.write }
+  turn.proc.stepUsageMeasured = true
+  turn.proc.stepUsageMissTurns = 0
   if (final) turn.stepUsageReconciled = true
   step.usageKind = "agy_model_call"
   step.modelCalls = steps.length
@@ -7166,10 +7189,13 @@ async function settleUsage(proc, turn, step, content, result) {
     if (measured) return measured
     // Any unconsumed generation from this turn (cancelled, timed out, locked, or
     // an empty `.pb` / unreadable store) could land after the next turn reads
-    // MAX(idx) or keep costing 1s per turn. Stop trusting the store on this
-    // process and fall back to bounded window estimates.
+    // MAX(idx) or keep costing 1s per turn. Disable immediately for cancelled
+    // turns or never-measured stores; a proven-live store only falls back for
+    // this turn and lets finalizeTurn decide whether the next turn re-probes.
     turn.stepCursor = null
-    if (turn.stepsFile) proc.stepUsageTrusted = false
+    if (turn.stepsFile && (!proc.stepUsageMeasured || result?.stopReason === "cancelled" || turn.cancelRequested)) {
+      proc.stepUsageTrusted = false
+    }
     return responseUsage(proc, turn, step, content, result)
   } finally {
     turn.sawGenerationOutput = false
