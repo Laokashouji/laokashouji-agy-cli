@@ -106,8 +106,10 @@ MCP server. The control port listens on loopback only, with a token per process.
   (SillyTavern presets, "continue"/"impersonate", bot frameworks) are served
   instead of rejected; the session ledger stays aligned across turns. See
   "Assistant prefill" below.
-- **Usage visibility**: Magpie shows the agy subscription usage windows. They are
-  informational only; running out of quota does not block requests automatically.
+- **Usage visibility**: Magpie shows the agy subscription usage windows. Each
+  model's window (its pool's most used one) is what Magpie's routing weighs the
+  account by for that model, so a routing group puts it by what it has left,
+  and a model whose pool is used up is passed over for the next member.
 
 ## Assistant prefill
 
@@ -262,6 +264,13 @@ reads whether one is there and when it ends. With none, with one that has ended
 and can't be renewed, or with one agy already failed on, agy is not run: the
 account shows its sign-in has expired until you sign in again. Other failed
 usage reads wait 10 minutes before the next try, doubling up to 6 hours.
+
+On macOS, a Magpie run as a LaunchDaemon is outside your login session and
+can't read your login keychain, and neither can agy there. An account of agy's
+own then runs with the copy of its sign-in the Magpie window kept (see above);
+one with no copy says why: run Magpie with `magpie daemon install` (a service of
+your own) or the Magpie app instead, or sign it in with "Add another Google
+account", which keeps its sign-in in a file.
 
 ## Environment variables
 
