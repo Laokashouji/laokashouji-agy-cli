@@ -61,6 +61,7 @@ const IDE_TOOL_PREFIX = "mcp_ide-tools_"
 // agy 1.3.5+: a tools/list entry with this _meta key is never deferred.
 const ALWAYS_LOAD = "antigravity/alwaysLoad"
 const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 10 * 60 * 1000)
+const EPHEMERAL_IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_EPHEMERAL_IDLE_MS, 60 * 1000)
 // Read at call time so a host (or a test) can size the pool without a reload.
 function maxProcs() {
   return positiveTimeout(process.env.AGY_BRIDGE_MAX_PROCS, 16)
@@ -69,7 +70,11 @@ function maxProcs() {
 function detachedEvictMs() {
   return positiveTimeout(process.env.AGY_BRIDGE_DETACHED_EVICT_MS, 30_000)
 }
-const MAX_PARKED = 32
+function maxParked() {
+  return positiveTimeout(process.env.AGY_BRIDGE_MAX_PARKED, 256)
+}
+const EPHEMERAL_PARKED_MAX = 16
+const TOOLS_GROWN_CONTINUE_NOTE = "The tool results above have been delivered and the newly loaded tools are now available. Continue."
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
 const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
@@ -2239,6 +2244,8 @@ class Proc {
     this.openingImages = openingImagesOf(opts.messages?.[0])
     this.resumeFrom = opts.resume || null
     this.stateless = statelessRequest(opts)
+    this.sideQuestion = !!opts.sideQuestion
+    this.cancelledExpectedBase = null
   }
 
   async start() {
@@ -2288,6 +2295,7 @@ class Proc {
     this.historyInvalid = false
     this.unsentPrompt = null
     this.expectedMessages = null
+    this.cancelledExpectedBase = null
     this.omittedHistoryTokens = 0
     this.contextAnchor = null
     this.keptCompactionContext = null
@@ -2678,6 +2686,7 @@ class Proc {
     turn.model = model
     this.turn = turn
     this.expectedMessages = messages.map((message) => ({ ...message }))
+    this.cancelledExpectedBase = null
     this.historyInvalid = false
     this.lastUsed = Date.now()
     this.#runTurn(turn, content, model, selection).catch(() => {})
@@ -2687,39 +2696,7 @@ class Proc {
   matchesHistory(messages) {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
-    const expectedKey = historyKey(this.expectedMessages)
-    const actualKey = historyKey(messages)
-    if (expectedKey === actualKey) return true
-    // magpie's masking can mask a text the session already has differently
-    // on a later request: the local model that missed it under load (the
-    // rules masked it alone) reads it for a later one, and a value in an
-    // earlier message becomes a {{KIND_xxxxxxxx}} placeholder. The history
-    // is the same one, so the session holds (yetone/magpie#7223).
-    if (sameHistoryUpToMasking(this.expectedMessages, messages)) return true
-    // A proxy between the client and magpie (billion-context's nudge) can
-    // add text after a step's tool results for one request; the client never
-    // had it, so the next request's history goes on without it
-    // (yetone/magpie#7223).
-    if (droppedOneRequestText(this.expectedMessages, messages)) return true
-    // Clients such as Claude Code canonicalize tool_use.input when they
-    // persist history (e.g. filling default replace_all: false). The live
-    // session still has the model-issued arguments. historyKey already
-    // ordinalizes tool ids, so this loose path (reached only after an exact
-    // historyKey miss) requires the raw tool_use id+name sequence to line
-    // up before ignoring input values. An exact match can still succeed if
-    // only ids changed and inputs did not.
-    if (sameToolUseIdentities(this.expectedMessages, messages)) {
-      const expectedStripped = stripToolUseInputs(this.expectedMessages)
-      const actualStripped = stripToolUseInputs(messages)
-      if (historyKey(expectedStripped) === historyKey(actualStripped) ||
-        sameHistoryUpToMasking(expectedStripped, actualStripped)) return true
-    }
-    // A client that compacts its own context (billion-context in DeepSeek
-    // Harness) folds earlier messages into a summary the live session never
-    // saw. agy still holds those messages whole, so the session holds as long
-    // as everything after the client's summary is what the session has
-    // (plugins#1401: each fold dropped the session and replayed ~10 KB).
-    return compactedEarlierHistory(this.expectedMessages, messages)
+    return matchesHistoryMessages(this.expectedMessages, messages)
   }
 
   // messages are where this session's history stood one or more turns back:
@@ -2790,6 +2767,7 @@ class Proc {
     if (turn.done && !turn.finalized) this.finalizeTurn(turn)
     if (!turn.finalized || this.dead || this.stopping || this.historyInvalid || this.turn) return false
     this.expectedMessages = history.map((message) => ({ ...message }))
+    this.cancelledExpectedBase = null
     return true
   }
 
@@ -2978,9 +2956,11 @@ class Proc {
     if (turn.hasPendingMcp() || this.dead) return false
     turn.cancelRequested = true
     turn.detach()
+    const beforePartial = this.expectedMessages ? this.expectedMessages.map((message) => ({ ...message })) : null
     if (this.expectedMessages && partialContent.length) {
       this.expectedMessages.push({ role: "assistant", content: partialContent })
     }
+    this.cancelledExpectedBase = beforePartial
     this.conn.notify("session/cancel", { sessionId: this.sessionId })
     const timer = setTimeout(() => {
       if (!turn.finalized) {
@@ -3216,7 +3196,13 @@ class Proc {
     }
     if (this.turn === turn) {
       this.turn = null
-      if (!this.stopping && !this.retiring) park(this)
+      if (this.sideQuestion && !this.stopping && !this.retiring) {
+        this.retiring = true
+        dropFromPool(this)
+        this.stop().catch(() => {})
+      } else if (!this.stopping && !this.retiring) {
+        park(this)
+      }
     }
   }
 
@@ -3243,6 +3229,7 @@ class Proc {
   }
 
   canPark() {
+    if (this.sideQuestion || this.stateless) return false
     return !!this.sessionId && this.hasSentFirstTurn && !this.historyInvalid && !this.turn &&
       !this.dead && Array.isArray(this.expectedMessages)
   }
@@ -3557,6 +3544,28 @@ function withStateLock(file, fn) {
   }
 }
 
+function isEphemeralProc(proc) {
+  return !!proc && (proc.stateless || proc.sideQuestion ||
+    (proc.sessionPrompts <= 1 && !proc.tools?.length && !proc.sessionScope && !proc.workDir))
+}
+
+function trimParkedEntries(entries) {
+  const limit = maxParked()
+  const ephemeralCap = Math.min(EPHEMERAL_PARKED_MAX, Math.max(0, Math.floor(limit / 4)))
+  const stateful = []
+  const ephemeral = []
+  for (const entry of entries) {
+    if (entry?.ephemeral) ephemeral.push(entry)
+    else stateful.push(entry)
+  }
+  stateful.sort((a, b) => a.at - b.at)
+  ephemeral.sort((a, b) => a.at - b.at)
+  const keptStateful = stateful.slice(-limit)
+  const remaining = Math.max(0, limit - keptStateful.length)
+  const keptEphemeral = ephemeral.slice(-Math.min(ephemeralCap, remaining))
+  return [...keptStateful, ...keptEphemeral].sort((a, b) => a.at - b.at)
+}
+
 // Merge with the file so concurrent bridge processes do not erase each other.
 function saveParked() {
   const file = sessionStateFile()
@@ -3568,7 +3577,7 @@ function saveParked() {
       for (const [key, entry] of parked) {
         if ((merged.get(key)?.at ?? 0) <= entry.at) merged.set(key, entry)
       }
-      const entries = [...merged.values()].sort((a, b) => a.at - b.at).slice(-MAX_PARKED)
+      const entries = trimParkedEntries([...merged.values()])
       const temp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
       fs.writeFileSync(temp, JSON.stringify({ version: 1, entries }) + "\n", { mode: 0o600 })
       fs.renameSync(temp, file)
@@ -3603,9 +3612,12 @@ function park(proc) {
     instructionsInSession: !!proc.instructionsInSession,
     workDir: proc.workDir,
     workspace: proc.workspace,
+    ...(isEphemeralProc(proc) ? { ephemeral: true } : {}),
     at: Date.now(),
   })
-  while (parked.size > MAX_PARKED) parked.delete(parked.keys().next().value)
+  const kept = trimParkedEntries([...parked.values()])
+  parked.clear()
+  for (const entry of kept) parked.set(entry.key, entry)
   saveParked()
 }
 
@@ -3658,11 +3670,13 @@ async function retire(key, proc) {
 async function evictIdle() {
   const now = Date.now()
   const cutoff = now - IDLE_MS
+  const ephemeralCutoff = now - Math.min(IDLE_MS, EPHEMERAL_IDLE_MS)
   const victims = []
   const stale = []
   for (const [key, proc] of pool) {
     if (proc.retiring) continue
-    if (proc.dead || (!proc.turn && proc.lastUsed < cutoff)) victims.push([key, proc])
+    const procCutoff = isEphemeralProc(proc) ? ephemeralCutoff : cutoff
+    if (proc.dead || (!proc.turn && proc.lastUsed < procCutoff)) victims.push([key, proc])
     else if (proc.turn) {
       // A turn that can never make progress again must not hold a pool slot.
       const verdict = staleTurnVerdict(proc, proc.turn, now)
@@ -3678,18 +3692,25 @@ async function evictIdle() {
   }
 }
 
-// Two levels: the least recently used process without a turn first; when every
-// process holds a turn, the oldest tool turn whose client detached long ago (or
-// whose deadline passed). Its conversation replays from history on its next
-// complete tool round, so the pool never starves on abandoned tool waits.
+// Two levels: the least recently used process without a turn first (evicting
+// one-shot ephemeral procs before stateful chats); when every process holds a
+// turn, the oldest tool turn whose client detached long ago (or whose deadline
+// passed). Its conversation replays from history on its next complete tool
+// round, so the pool never starves on abandoned tool waits.
 async function evictLRU() {
+  let oldestEphemeral = null
   let oldest = null
   for (const [key, proc] of pool) {
     if (proc.turn || proc.retiring) continue
-    if (!oldest || proc.lastUsed < oldest.proc.lastUsed) oldest = { key, proc }
+    if (isEphemeralProc(proc)) {
+      if (!oldestEphemeral || proc.lastUsed < oldestEphemeral.proc.lastUsed) oldestEphemeral = { key, proc }
+    } else if (!oldest || proc.lastUsed < oldest.proc.lastUsed) {
+      oldest = { key, proc }
+    }
   }
-  if (oldest) {
-    await retire(oldest.key, oldest.proc)
+  const chosen = oldestEphemeral || oldest
+  if (chosen) {
+    await retire(chosen.key, chosen.proc)
     return true
   }
   const now = Date.now()
@@ -3816,6 +3837,54 @@ async function withAcquireLocks(keys, fn) {
   return run(0)
 }
 
+function matchesHistoryMessages(expected, actual) {
+  if (!Array.isArray(expected) || !Array.isArray(actual)) return false
+  if (historyKey(expected) === historyKey(actual)) return true
+  if (sameHistoryUpToMasking(expected, actual)) return true
+  if (droppedOneRequestText(expected, actual)) return true
+  if (sameToolUseIdentities(expected, actual)) {
+    const expectedStripped = stripToolUseInputs(expected)
+    const actualStripped = stripToolUseInputs(actual)
+    if (historyKey(expectedStripped) === historyKey(actualStripped) ||
+      sameHistoryUpToMasking(expectedStripped, actualStripped)) return true
+  }
+  return compactedEarlierHistory(expected, actual)
+}
+
+// A client that aborts (499) mid-generation after delivering tool results (or a
+// user prompt) often drops the uncommitted assistant reply and appends
+// "[Request interrupted by user]" + a follow-up right after the already-delivered
+// message(s). Recognize that continuation so the cancelled live session stays
+// usable instead of triggering forceNew + 112 KiB replay.
+function matchCancelledContinuation(proc, opts) {
+  const base = proc?.cancelledExpectedBase
+  const msgs = opts?.messages
+  if (!Array.isArray(base) || !base.length || !Array.isArray(msgs)) return null
+  const k = base.length
+  if (msgs.length > k && matchesHistoryMessages(base, msgs.slice(0, k))) {
+    return { matchedHistory: msgs.slice(0, k), answeredIds: null }
+  }
+  const lastBase = base[k - 1]
+  const lastMsg = msgs[k - 1]
+  if (lastBase?.role !== "user" || lastMsg?.role !== "user") return null
+  if (!matchesHistoryMessages(base.slice(0, k - 1), msgs.slice(0, k - 1))) return null
+  const baseBlocks = Array.isArray(lastBase.content) ? lastBase.content : []
+  const msgBlocks = Array.isArray(lastMsg.content) ? lastMsg.content : []
+  const baseResults = baseBlocks.filter((block) => block?.type === "tool_result")
+  const msgResults = msgBlocks.filter((block) => block?.type === "tool_result")
+  if (!baseResults.length || baseResults.length !== msgResults.length) return null
+  const sameIds = baseResults.every((block, i) => block.tool_use_id === msgResults[i].tool_use_id)
+  if (!sameIds) return null
+  if (historyKey([{ role: "user", content: baseResults }]) !== historyKey([{ role: "user", content: msgResults }])) {
+    return null
+  }
+  if (msgBlocks.length <= baseBlocks.length && msgs.length <= k) return null
+  return {
+    matchedHistory: msgs.slice(0, k - 1),
+    answeredIds: new Set(msgResults.map((block) => block.tool_use_id)),
+  }
+}
+
 // begin, when given, starts the turn inside the same locks, so a request that
 // waits on them sees this one's turn and is never handed a process about to be busy.
 async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew = false, begin = null) {
@@ -3823,13 +3892,13 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
   // the new key (sorted, to avoid deadlock), then pick again inside those
   // locks. A process is re-keyed only when its current key is already held.
   let extra = null
-  const launch = !forceNew && isFreshConversation && statelessRequest(opts)
+  const launch = !forceNew && !opts.unmatchedToolResults && isFreshConversation && statelessRequest(opts)
     ? await launchKey(agyPath, opts.workDir).catch(() => null) : null
   for (let attempt = 0; ; attempt++) {
     const keys = extra && extra !== convKey ? [convKey, extra] : [convKey]
     const outcome = await withAcquireLocks(keys, async () => {
       const locked = new Set(keys)
-      if (!forceNew && !pool.get(convKey)) {
+      if (!forceNew && !opts.unmatchedToolResults && !pool.get(convKey)) {
         const candidate = (isFreshConversation ? findLiveContinuedProc(opts) : findRemaskedProc(convKey, opts)) ||
           findCompactedProc(convKey, opts) ||
           findStatelessDonor(opts, launch)
@@ -3837,7 +3906,7 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
         if (needed && !locked.has(needed) && attempt < 2) return { retry: needed }
       }
       const value = await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew, locked, launch)
-      return { value: begin ? { ...value, turn: await begin(value.proc, value.history) } : value }
+      return { value: begin ? { ...value, turn: await begin(value.proc, value.history, value.answeredIds) } : value }
     })
     if (outcome.retry) {
       extra = outcome.retry
@@ -3902,7 +3971,7 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       compacted = true
     }
   }
-  let why = forceNew && opts.dropReason ? opts.dropReason : "no_live"
+  let why = (forceNew || opts.unmatchedToolResults) && opts.dropReason ? opts.dropReason : "no_live"
   let historyDiff
   let key = convKey
   if (existing && !existing.dead && existing.turn && isFreshConversation && !forceNew &&
@@ -3922,7 +3991,14 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       throw new BusyError("agy bridge: this conversation still has an unfinished response")
     }
     let matchedHistory = opts.history
-    if (!forceNew && !existing.dead && !existing.retiring && existing.unsentPrompt &&
+    let cancelledMatch = null
+    if (!forceNew && !existing.dead && !existing.retiring && existing.cancelledExpectedBase &&
+      !(opts.unmatchedToolResults ? false : existing.matchesHistory(matchedHistory))) {
+      cancelledMatch = matchCancelledContinuation(existing, opts)
+      if (cancelledMatch) matchedHistory = cancelledMatch.matchedHistory
+    }
+    const effectiveForceNew = forceNew || (!!opts.unmatchedToolResults && !cancelledMatch)
+    if (!effectiveForceNew && !cancelledMatch && !existing.dead && !existing.retiring && existing.unsentPrompt &&
       Array.isArray(opts.messages) && Array.isArray(existing.expectedMessages)) {
       const k = existing.expectedMessages.length
       if (k > matchedHistory.length && k <= opts.messages.length &&
@@ -3936,12 +4012,12 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     // appends the summary instructions to that exchange's user message. The
     // live session has the whole conversation; a new one gets a replay cut to
     // the prompt budget, and summarizes what is left of it.
-    const compactionFork = !forceNew && !!opts.compaction && !existing.dead && !existing.retiring &&
+    const compactionFork = !effectiveForceNew && !!opts.compaction && !existing.dead && !existing.retiring &&
       !existing.matchesHistory(matchedHistory) && existing.continuesPast(matchedHistory)
     const workDirCompatible = existing.hasSentFirstTurn || existing.workDir === opts.workDir
-    const compatible = !forceNew && !existing.dead && !existing.retiring &&
+    const compatible = !effectiveForceNew && !existing.dead && !existing.retiring &&
       workDirCompatible && sameInstructions(existing.instructions, opts.instructions) &&
-      (existing.matchesHistory(matchedHistory) || continuedFresh || compactionFork || compacted)
+      (!!cancelledMatch || existing.matchesHistory(matchedHistory) || continuedFresh || compactionFork || compacted)
     if (compatible && (!(isFreshConversation && existing.hasSentFirstTurn) || continuedFresh || compacted)) {
       if (continuedFresh) {
         const first = Array.isArray(opts.messages) ? opts.messages[0] : null
@@ -3954,6 +4030,7 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       // agy never listed the tools this request declares (an agy started
       // with none whose MCP server never connected): a new one may.
       if (existing.toolsListed()) {
+        if (cancelledMatch) logBridgeEvent(existing, null, "kept", "cancelled_turn_continuation", opts)
         if (compactionFork) logBridgeEvent(existing, null, "kept", "compaction_fork", opts)
         if (compacted) {
           logBridgeEvent(existing, null, "kept", "compacted_opening", opts)
@@ -3962,11 +4039,11 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
           // agy has none of the compacted conversation's messages yet: all go
           return { proc: existing, history: [] }
         }
-        return { proc: existing, history: matchedHistory }
+        return { proc: existing, history: matchedHistory, answeredIds: cancelledMatch?.answeredIds ?? null }
       }
       why = "tools_unlisted"
     } else {
-      why = forceNew ? "forced" : existing.dead ? "dead" : existing.retiring ? "retiring" :
+      why = effectiveForceNew ? "forced" : existing.dead ? "dead" : existing.retiring ? "retiring" :
         !workDirCompatible ? "work_dir" :
         !sameInstructions(existing.instructions, opts.instructions) ? "instructions" :
         !(existing.matchesHistory(matchedHistory) || continuedFresh) ? "history" : "fresh_after_first"
@@ -3974,7 +4051,7 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       // as drop_live logs it (yetone/magpie#7223)
       if (why === "history") historyDiff = firstHistoryDiff(existing.expectedMessages, matchedHistory)
     }
-    if (!forceNew && launch && statelessRequest(opts) &&
+    if (!effectiveForceNew && launch && statelessRequest(opts) &&
       statelessDonor(existing, launch, opts.userId || "", opts.sessionScope || "", opts.workDir)) {
       // the same stateless request again: its agy answers it in a new session
       return await reuseStateless(existing, key, opts, why)
@@ -3983,11 +4060,12 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     dropFromPool(existing)
     await existing.stop().catch(() => {})
   }
-  if (!forceNew && isFreshConversation && launch) {
+  const forceNewFresh = forceNew || !!opts.unmatchedToolResults
+  if (!forceNewFresh && isFreshConversation && launch) {
     const donor = findStatelessDonor(opts, launch)
     if (donor && lockedKeys.has(donor.convKey) && key === convKey) return await reuseStateless(donor, key, opts, "stateless_reuse")
   }
-  const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
+  const resume = forceNewFresh || isFreshConversation ? null : takeParked(convKey, opts)
   const launchWorkDir = resume && "workDir" in resume ? resume.workDir : opts.workDir
   // a spare runs in a folder of its own, and a resumed session needs its own
   const spare = resume?.workspace ? null : await takeSpare(agyPath, launchWorkDir)
@@ -4254,7 +4332,7 @@ function replayHistoryProblem(body, resultBlocks) {
 // the client's history, ready for its next message. False when the session
 // can't take it as it is; the caller then replays, as for a fork.
 async function keepDroppedTurn(proc, turn, opts) {
-  if (proc.toolsGrew(opts.tools) || !sameInstructions(proc.instructions, opts.instructions)) return false
+  if (!sameInstructions(proc.instructions, opts.instructions)) return false
   const results = turn.calls.filter((call) => call.id && !call.result && !call.mcpResponded).map((call) => ({
     block: { tool_use_id: call.id },
     call,
@@ -5338,6 +5416,20 @@ const CLAUDE_COMPACT_PROMPT = "Your task is to create a detailed summary of the 
 
 function isCompactionTurn(messages) {
   return messages.some((message) => message?.role === "user" && contentText(message.content).includes(CLAUDE_COMPACT_PROMPT))
+}
+
+// Claude Code's /btw side-question prompt: shares the main session's prefix for
+// prompt caching on stateless APIs, but must never append to the main stateful
+// agy session or its expectedMessages (which would break the next main turn).
+const CLAUDE_SIDE_QUESTION_HEAD = "This is a side question from the user. You must answer this question directly in a single response."
+const CLAUDE_SIDE_QUESTION_CONTEXT = "You are a separate, lightweight agent spawned to answer this one question"
+
+function isSideQuestionTurn(messages) {
+  return Array.isArray(messages) && messages.some((message) => {
+    if (message?.role !== "user") return false
+    const text = contentText(message.content)
+    return text.includes(CLAUDE_SIDE_QUESTION_HEAD) && text.includes(CLAUDE_SIDE_QUESTION_CONTEXT)
+  })
 }
 
 // How Claude Code opens the conversation it goes on with after a compaction:
@@ -7795,7 +7887,7 @@ function withoutAnswered(messages, answered) {
     : message)
 }
 
-async function beginTurn(proc, history, body, callerWorkDir, model, selection, answered) {
+async function beginTurn(proc, history, body, callerWorkDir, model, selection, answered, toolsGrewContinuation = false) {
   const reminder = outputFormatReminder(body)
   const flattened = proc.pendingFlattenedTurn
   proc.pendingFlattenedTurn = null
@@ -7805,6 +7897,11 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, a
     baseParts = renderContinuedTurnParts(flattened
       ? [flattened, ...body.messages.slice(1)]
       : withoutAnswered(body.messages.slice(history.length), answered))
+    const hasUserSubstance = baseParts.some((part) =>
+      part?.type === "image" || (part?.type === "text" && !isMetaOnlyUserText(part.text)))
+    if (!hasUserSubstance && (toolsGrewContinuation || (!baseParts.length && answered?.size))) {
+      baseParts = mergePromptParts(baseParts, [{ type: "text", text: TOOLS_GROWN_CONTINUE_NOTE }])
+    }
   } else {
     const initial = renderInitialPrompt(body, callerWorkDir, proc.instructionsInSession,
       reminder.length ? promptTextBytes(reminder) + 2 : 0)
@@ -8171,9 +8268,14 @@ export const AntigravityBridgePlugin = async () => {
             const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
             const selection = { model: requestedModel, effort: requestedEffort(body) }
             const sessionScope = requestSessionScope(fetchInput, init)
-            // an account's conversations are its own: its agy has them
-            const convKey = (home ? `acct:${path.basename(home)}:` : "") + conversationKey(body, sessionScope)
+            const reqId = "req_" + randomBytes(4).toString("hex")
             const trailing = trailingMessages(body)
+            const sideQuestion = isSideQuestionTurn(trailing.messages)
+            // an account's conversations are its own: its agy has them;
+            // /btw side questions run in an isolated ephemeral key so they
+            // never mutate or block the main conversation's live session.
+            const baseConvKey = (home ? `acct:${path.basename(home)}:` : "") + conversationKey(body, sessionScope)
+            const convKey = sideQuestion ? `${baseConvKey}#btw:${reqId}` : baseConvKey
             const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
             const callerWorkDir = namedWorkDirectory(body, init)
@@ -8192,22 +8294,23 @@ export const AntigravityBridgePlugin = async () => {
                   entry.turn.touchClient()
                 }
               }
-              const reqId = "req_" + randomBytes(4).toString("hex")
               rememberRequestMeta(reqId, { layout, nonstream: body.stream === false })
               // Same conversation, other layout: one key, no replacement session.
               // Routine for some clients, so reported only in verbose mode.
-              if (noteLayout(convKey, layout) && process.env.AGY_BRIDGE_EVENTS === "verbose") {
+              if (!sideQuestion && noteLayout(convKey, layout) && process.env.AGY_BRIDGE_EVENTS === "verbose") {
                 logBridgeEvent(null, null, "layout_flip", "layout_canonicalized",
                   { reqId, convKey, layout, nonstream: body.stream === false })
               }
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false, reqId, convKey,
                 hasToolResults: resultBlocks.length > 0, compaction: isCompactionTurn(trailing.messages),
-                userId: body.metadata?.user_id || "", sessionScope }
+                sideQuestion, userId: body.metadata?.user_id || "", sessionScope }
               let answeredIds = null
-              const begin = (proc, history) => beginTurn(proc, history, body, callerWorkDir, model, selection, answeredIds)
+              let toolsGrewContinuation = false
+              const begin = (proc, history, extraAnswered) =>
+                beginTurn(proc, history, body, callerWorkDir, model, selection, extraAnswered ?? answeredIds, toolsGrewContinuation)
               let keptSession = false
-              if (resultBlocks.length) {
+              if (resultBlocks.length && !sideQuestion) {
                 const matches = matchToolResults(body, resultBlocks, sessionScope)
                 const found = matches.filter((item) => item.match)
                 if (found.length) {
@@ -8248,31 +8351,37 @@ export const AntigravityBridgePlugin = async () => {
                   // read, so a result with one takes the steer's way: the call
                   // gets the text, the next prompt the image.
                   const imageResult = proc.supportsImages && results.some((item) => resultHasImage(item.result))
+                  const toolsGrew = proc.toolsGrew(tools)
                   const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
                   const historyMatches = directIdsMatch
                     ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
                     : proc.matchesHistory(trailingMessages(body).history)
-                  // A steer keeps the live session, so agy's prompt cache holds: the
-                  // calls are answered with their real results, the step is
-                  // cancelled, and the steer goes in as the next prompt.
-                  if ((interrupted || imageResult) && historyMatches && !proc.toolsGrew(tools) &&
+                  // A steer (or grown tool catalog) keeps the live session, so
+                  // agy's full trajectory holds: the calls are answered with
+                  // their real results, the step is cancelled, tools are
+                  // re-listed before the next session/prompt, and the next
+                  // prompt runs in the same live session.
+                  if ((interrupted || imageResult || toolsGrew) && historyMatches &&
                     sameInstructions(proc.instructions, instructions) &&
                     await proc.steerInSession(turn, rawResults, trailingMessages(body).history)) {
                     keptSession = true
+                    toolsGrewContinuation = toolsGrew
+                    if (toolsGrew) logBridgeEvent(proc, turn, "kept", "tools_grew", acquireOpts)
                     answeredIds = new Set(
                       rawResults
                         .filter((item) => !item.call.deferred || item.call.lateDelivered)
                         .map((item) => item.block.tool_use_id),
                     )
-                  } else if (interrupted || imageResult || !historyMatches || proc.toolsGrew(tools) ||
+                  } else if (interrupted || imageResult || !historyMatches || toolsGrew ||
                     !sameInstructions(proc.instructions, instructions)) {
-                    // A changed context, a tool catalog that grew, or a
-                    // user-interrupted tool turn needs a new session. Replay the
-                    // real results without resolving the old process's calls.
+                    // A changed context, a tool catalog that grew (when steer
+                    // could not settle), or a user-interrupted tool turn needs
+                    // a new session. Replay the real results without resolving
+                    // the old process's calls.
                     const dropReason = interrupted ? "interrupted"
                       : imageResult ? "image_result"
                       : !historyMatches ? "history_mismatch"
-                      : proc.toolsGrew(tools) ? "tools_grew"
+                      : toolsGrew ? "tools_grew"
                       : "instructions"
                     logBridgeEvent(proc, turn, "drop_live", dropReason, acquireOpts, {
                       history: trailingMessages(body).history.length,
@@ -8343,12 +8452,13 @@ export const AntigravityBridgePlugin = async () => {
                 }
               }
 
+              acquireOpts.unmatchedToolResults = resultBlocks.length > 0 && !keptSession
               const { proc, turn } = await acquireProc(
                 agy,
                 convKey,
                 acquireOpts,
                 isFresh,
-                resultBlocks.length > 0 && !keptSession,
+                sideQuestion,
                 begin,
               )
               return streamResponse(proc, turn, body, init.signal)

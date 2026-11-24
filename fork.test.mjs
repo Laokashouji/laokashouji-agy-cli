@@ -5,7 +5,7 @@ import path from "node:path"
 
 const dir = path.join(import.meta.dir, "test")
 
-for (const name of ["compaction-fork.mjs", "workdir-change.mjs", "prompt-budget-reminders.mjs", "step-usage-recovery.mjs"]) {
+for (const name of ["compaction-fork.mjs", "workdir-change.mjs", "prompt-budget-reminders.mjs", "step-usage-recovery.mjs", "session-retention.mjs"]) {
   test(`test/${name}`, () => {
     const result = Bun.spawnSync({ cmd: [process.execPath, "test", "--timeout", "120000", `./${name}`], cwd: dir, env: { ...process.env, AGY_BRIDGE_STORED_SIGNIN: "skip" }, stdout: "pipe", stderr: "pipe", timeout: 240_000 })
     const output = result.stdout.toString() + result.stderr.toString()
