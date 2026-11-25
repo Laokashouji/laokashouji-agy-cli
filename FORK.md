@@ -21,6 +21,6 @@ magpie plugin add github:Laokashouji/laokashouji-agy-cli
 
 ## 与上游同步
 
-GitHub Actions 每天合并一次上游的新提交（见 `.github/workflows/sync-upstream.yml`）。合并无冲突且测试通过才更新 `main`；否则 `main` 保持不变，并自动开一个 `sync-failed` issue。
+日常由定时任务每天自动拉取上游新提交并运行全量 `bun test`；遇到合并冲突或测试失败时由 AI 自动解冲突并复跑测试，全量通过后自动推送 `main` 与 `upstream`。
 
-`upstream` 分支是上游 `packages/agy-cli` 目录的原样历史。
+仓库内的 `.github/workflows/sync-upstream.yml` 保留为手动触发（`workflow_dispatch`）的备用入口。`upstream` 分支是上游 `packages/agy-cli` 目录的原样历史。

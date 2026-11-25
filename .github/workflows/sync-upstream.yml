@@ -1,10 +1,9 @@
 name: 同步上游
 
-# 每天把 magpie-community/plugins 里 packages/agy-cli 的新提交合并进 main。
+# 手动把 magpie-community/plugins 里 packages/agy-cli 的新提交合并进 main。
+# 日常定时同步与自动解冲突由外部定时任务负责，这里仅保留手动触发以避免竞态。
 # 合并无冲突且 bun test 通过才推送；否则不推送，开一个 sync-failed issue。
 on:
-  schedule:
-    - cron: "17 1 * * *" # 北京时间每天 09:17
   workflow_dispatch:
 
 permissions:
