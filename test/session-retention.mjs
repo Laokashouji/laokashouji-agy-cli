@@ -368,3 +368,131 @@ test("499 abort mid-generation after tool_result keeps live session (separate an
     })
   }
 })
+
+test("499 abort during /compact fork does not wedge follow-up turn with thinking block 400", async () => {
+  const COMPACT = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n" +
+    "Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."
+
+  await withKit({}, async (kit, stderr) => {
+    let step = 0
+    kit.defaultPrompt = async (agent) => {
+      step++
+      if (step === 1) {
+        agent.update({ sessionUpdate: "tool_call", toolCallId: "r1", status: "in_progress" })
+        await agent.tool("Read", { path: "/file.ts" })
+        agent.update({ sessionUpdate: "tool_call_update", toolCallId: "r1", status: "completed" })
+        await agent.thought("reasoning before final reply")
+        await agent.text("done reading")
+        return { stopReason: "end_turn", usage: USAGE }
+      }
+      if (step === 2) {
+        await agent.thought("compacting thought...")
+        await agent.waitCancel()
+        return { stopReason: "cancelled", usage: USAGE }
+      }
+      await agent.text("follow-up succeeded")
+      return { stopReason: "end_turn", usage: USAGE }
+    }
+
+    const body1 = baseBody({ tools: [READ_TOOL], messages: [{ role: "user", content: "inspect file" }] })
+    const res1 = await readSse(await kit.request(body1))
+    assert.equal(res1.stopReason, "tool_use")
+
+    const body2 = continueWithToolResults(body1, res1, () => "line 1: hello")
+    const res2 = await readSse(await kit.request(body2))
+    assert.equal(res2.stopReason, "end_turn")
+    assert.ok(res2.content.some((block) => block.type === "thinking"))
+
+    const historyWithReply = [...body2.messages, { role: "assistant", content: res2.content }]
+    // Claude Code 的 /compact 会暂时去掉最后一条 assistant 回复，并把压缩指令拼在上一条 tool_result 用户消息之后。
+    const toolResultMsg = body2.messages.at(-1)
+    const compactFork = {
+      ...body2,
+      messages: [
+        ...body2.messages.slice(0, -1),
+        { role: "user", content: [...toolResultMsg.content, { type: "text", text: COMPACT }] },
+      ],
+    }
+
+    const ac = new AbortController()
+    const compactRes = await kit.request(compactFork, { signal: ac.signal })
+    const reader = compactRes.body.getReader()
+    await reader.read()
+    await reader.read()
+    ac.abort(new Error("compaction canceled"))
+    try { await reader.cancel() } catch {}
+    await sleep(50)
+
+    // 取消压缩后，客户端恢复携带完整历史（包含带 thinking 的 assistant 回复）发送新消息。
+    const followUp = {
+      ...body2,
+      messages: [
+        ...historyWithReply,
+        { role: "user", content: "follow-up after canceled compaction" },
+      ],
+    }
+    const raw3 = await kit.request(followUp)
+    assert.equal(raw3.status, 200)
+    const res3 = await readSse(raw3)
+    assert.equal(res3.stopReason, "end_turn")
+    const replyText = res3.content.filter((block) => block.type === "text").map((block) => block.text).join("")
+    assert.equal(replyText, "follow-up succeeded")
+    assert.ok(!stderr.lines.some((r) => r.reason === "cancelled_turn_continuation"))
+  })
+})
+
+test("499 abort continuation is rejected when follow-up re-introduces an assistant message after cancelled base", async () => {
+  await withKit({}, async (kit, stderr) => {
+    kit.prompts.push(async (agent) => {
+      agent.update({ sessionUpdate: "tool_call", toolCallId: "r1", status: "in_progress" })
+      await agent.tool("Read", { path: "/file.ts" })
+      agent.update({ sessionUpdate: "tool_call_update", toolCallId: "r1", status: "completed" })
+      await agent.thought("partial thinking")
+      await agent.waitCancel()
+      return { stopReason: "cancelled", usage: USAGE }
+    })
+    kit.defaultPrompt = async (agent) => {
+      await agent.text("replayed cleanly")
+      return { stopReason: "end_turn", usage: USAGE }
+    }
+
+    const body1 = baseBody({ tools: [READ_TOOL], messages: [{ role: "user", content: "inspect file" }] })
+    const res1 = await readSse(await kit.request(body1))
+    const body2 = continueWithToolResults(body1, res1, () => "line 1: hello")
+
+    const ac = new AbortController()
+    const res2 = await kit.request(body2, { signal: ac.signal })
+    const reader = res2.body.getReader()
+    await reader.read()
+    await reader.read()
+    ac.abort(new Error("client disconnected"))
+    try { await reader.cancel() } catch {}
+    await sleep(30)
+
+    // 客户端后续携带了包含 assistant(thinking + text) 的完整历史再继续对话，
+    // 不能把该 assistant 消息切给 renderContinuedTurnParts。
+    const followUp = {
+      ...body2,
+      messages: [
+        ...body2.messages,
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "prior reasoning", signature: "sig_1" },
+            { type: "text", text: "prior answer" },
+          ],
+        },
+        { role: "user", content: "next question" },
+      ],
+    }
+    const raw3 = await kit.request(followUp)
+    assert.equal(raw3.status, 200)
+    const res3 = await readSse(raw3)
+    assert.equal(res3.stopReason, "end_turn")
+    const replyText = res3.content.filter((block) => block.type === "text").map((block) => block.text).join("")
+    assert.equal(replyText, "replayed cleanly")
+    assert.ok(!stderr.lines.some((r) => r.reason === "cancelled_turn_continuation"))
+  })
+})
+
+

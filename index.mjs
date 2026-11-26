@@ -4072,10 +4072,15 @@ function matchCancelledContinuation(proc, opts) {
   const msgs = opts?.messages
   if (!Array.isArray(base) || !base.length || !Array.isArray(msgs)) return null
   const k = base.length
-  if (msgs.length > k && matchesHistoryMessages(base, msgs.slice(0, k))) {
+  const lastBase = base[k - 1]
+  // 被取消的 /compact 轮次已经把压缩提示词送进了活会话，不能作为普通续写复用。
+  if (isCompactionTurn([lastBase])) return null
+  // 续写切片只能落在 trailing.history 之后，避免把历史 assistant（如 thinking/tool_use）误送入 renderTurnMessage。
+  const minHistoryLen = Array.isArray(opts?.history) ? opts.history.length : 0
+  if (k >= minHistoryLen && msgs.length > k && matchesHistoryMessages(base, msgs.slice(0, k))) {
     return { matchedHistory: msgs.slice(0, k), answeredIds: null }
   }
-  const lastBase = base[k - 1]
+  if (k - 1 < minHistoryLen) return null
   const lastMsg = msgs[k - 1]
   if (lastBase?.role !== "user" || lastMsg?.role !== "user") return null
   if (!matchesHistoryMessages(base.slice(0, k - 1), msgs.slice(0, k - 1))) return null
