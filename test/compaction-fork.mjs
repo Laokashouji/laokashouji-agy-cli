@@ -6,7 +6,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { baseBody, createBridgeKit, readSse } from "./testkit.mjs"
+import { MESSAGES_URL, baseBody, createBridgeKit, readSse } from "./testkit.mjs"
 
 function captureStderr() {
   const lines = []
@@ -153,4 +153,24 @@ test("a second compaction before agy compacted its own window starts a new sessi
   const { opened, events } = await withCompaction(compactedOpening(SUMMARY), 2)
   assert.equal(events.filter((row) => row.reason === "compacted_opening").length, 1, JSON.stringify(events))
   assert.equal(opened.length, 2, JSON.stringify(opened))
+})
+
+test("a compacted conversation continues under the requesting account", async () => {
+  const kit = await createBridgeKit({})
+  try {
+    kit.defaultPrompt = async (agent) => {
+      await agent.text(SUMMARY)
+      return { stopReason: "end_turn" }
+    }
+    const summarize = baseBody({ messages: [{ role: "user", content: COMPACT }] })
+    await readSse(await kit.request(summarize))
+    const other = await kit.plugin.auth.loader(async () => ({ type: "oauth", metadata: { agyHome: "accountb1" } }))
+    const body = baseBody({ messages: [{ role: "user", content: compactedOpening(SUMMARY) }] })
+    const reply = await readSse(await other.fetch(MESSAGES_URL, { method: "POST", body: JSON.stringify(body) }))
+    assert.equal(reply.stopReason, "end_turn")
+    const prompt = kit.acpLog.findLast((entry) => entry.method === "session/prompt")
+    assert.match(kit.acpSpawns[prompt.spawn].env.HOME, /accountb1$/)
+  } finally {
+    await kit.dispose()
+  }
 })
