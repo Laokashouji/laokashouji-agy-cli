@@ -108,7 +108,7 @@ test("tools_grew: ToolSearch keeps live session, commits MCP result, re-lists gr
     assert.equal(res2.content.find((b) => b.type === "tool_use")?.name, "magic_echo")
     assert.equal(kit.acpSpawns.length, 1, "must keep the single live agy process")
     assert.match(deliveredSearch?.result?.content?.[0]?.text || "", /Loaded tool: magic_echo/)
-    assert.match(prompts(kit)[1], /newly loaded tools are now available/)
+    assert.match(prompts(kit)[1], /can be called now: magic_echo/)
     assert.ok(stderr.lines.some((r) => r.action === "kept" && r.reason === "tools_grew"))
 
     const body3 = continueWithToolResults(body2, res2, () => "MAGIC_OK:hi")
@@ -202,6 +202,32 @@ test("parked and pool priority: one-shot ephemeral bursts never evict stateful c
   })
 })
 
+test("a nonstreaming opening that gains history keeps its parked slot through one-shot requests", async () => {
+  await withKit({ sessionResume: true, env: { AGY_BRIDGE_MAX_PARKED: "1" } }, async (kit) => {
+    kit.defaultPrompt = async (agent) => {
+      await agent.text("answer")
+      return { stopReason: "end_turn", usage: USAGE }
+    }
+    const opening = baseBody({ stream: false, tools: undefined, messages: [{ role: "user", content: "open" }] })
+    const first = await kit.request(opening)
+    assert.equal(first.status, 200)
+    const reply = await first.json()
+    const entries = () => fs.existsSync(kit.stateFile) ? JSON.parse(fs.readFileSync(kit.stateFile, "utf8")).entries : []
+    assert.equal(entries().length, 0)
+
+    const continued = { ...opening, stream: true, messages: [...opening.messages,
+      { role: "assistant", content: reply.content }, { role: "user", content: "continue" }] }
+    assert.equal((await readSse(await kit.request(continued))).stopReason, "end_turn")
+    assert.equal(kit.acpSpawns.length, 1)
+    const [saved] = entries()
+    assert.ok(saved && !saved.ephemeral, "the continued conversation must be parked as stateful")
+
+    const oneShot = baseBody({ tools: undefined, messages: [{ role: "user", content: "one shot" }] })
+    assert.equal((await readSse(await kit.request(oneShot))).stopReason, "end_turn")
+    assert.deepEqual(entries().map((entry) => entry.sessionId), [saved.sessionId])
+  })
+})
+
 test("/btw side question runs in isolated ephemeral session without poisoning or blocking main chat", async () => {
   await withKit({}, async (kit) => {
     kit.prompts.push(async (agent) => {
@@ -292,6 +318,48 @@ test("/btw side question succeeds concurrently while main chat is busy in a pend
     const r2 = await readSse(await kit.request(m2, headers))
     assert.equal(r2.stopReason, "end_turn")
     assert.equal(kit.acpSpawns.length, 2)
+  })
+})
+
+test("only the original tool batch can reclaim a parked step after a directory change", async () => {
+  // Before 0.1.143 the model line was part of both the key and the saved instructions.
+  await withKit({ sessionResume: true, indexTransform: (source) =>
+    source.replace("legacy ? s : stripAgentModelLines(s)", "s") }, async (old) => {
+    const dirs = ["original", "other", "moved"].map((name) => fs.mkdtempSync(path.join(old.tmp, name)))
+    const headers = (dir) => ({ headers: { "x-magpie-work-dir": encodeURIComponent(dir), "x-magpie-session": "same-client" } })
+    const opening = baseBody({ system: "You are powered by the model example." })
+    old.prompts.push(async (agent) => {
+      await agent.tool("Read", { path: "/a" })
+      return { stopReason: "end_turn" }
+    })
+    const call = await readSse(await old.request(opening, headers(dirs[0])))
+    assert.equal(call.stopReason, "tool_use")
+    const result = continueWithToolResults(opening, call, () => "result")
+    const [saved] = JSON.parse(fs.readFileSync(old.stateFile, "utf8")).entries
+    await old.finishChildren()
+
+    await withKit({ sessionResume: true, env: { AGY_BRIDGE_STATE_FILE: old.stateFile } }, async (next) => {
+      next.defaultPrompt = async (agent) => {
+        await agent.text("ok")
+        return { stopReason: "end_turn" }
+      }
+      const resumes = () => next.acpLog.filter((row) => row.method === "session/resume").map((row) => row.params.sessionId)
+      const side = structuredClone(result)
+      side.messages.at(-1).content.push({ type: "text", text: BTW_REMINDER + "\nSide question?" })
+      assert.equal((await readSse(await next.request(side, headers(dirs[0])))).stopReason, "end_turn")
+      assert.deepEqual(resumes(), [])
+      assert.ok(JSON.parse(fs.readFileSync(old.stateFile, "utf8")).entries.some((entry) => entry.sessionId === saved.sessionId))
+
+      const other = structuredClone(result)
+      other.messages.at(-2).content.find((b) => b.type === "tool_use").id = "toolu_other"
+      other.messages.at(-1).content.find((b) => b.type === "tool_result").tool_use_id = "toolu_other"
+      assert.equal((await readSse(await next.request(other, headers(dirs[1])))).stopReason, "end_turn")
+      assert.deepEqual(resumes(), [])
+
+      assert.equal((await readSse(await next.request(result, headers(dirs[2])))).stopReason, "end_turn")
+      assert.deepEqual(resumes(), [saved.sessionId])
+      assert.ok(!prompts(next).at(-1).includes("<conversation_history>"))
+    })
   })
 })
 

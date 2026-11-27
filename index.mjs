@@ -9,7 +9,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { ACCOUNT_DISABLED_REFUSED, agyRefusal, createUsageReader, verifyLinkIn, verifyRefused } from "./usage.mjs"
 import { catalogRows, storeCatalogRows } from "./model-ids.mjs"
-import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, heldByAnother, isKeptId, keepOwn, keptFor, notHeldError, signedInEmail, storedEmail, storedSignIn, storedSignInNow } from "./signin.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, heldByAnother, homeForOwn, isKeptId, keepOwn, keptFor, keptOthers, notHeldError, ownerUnknown, signedInEmail, storedEmail, storedSignIn, storedSignInNow, unknownOwnerError, whoOf } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
 import { accountsDir, currentHome, dropHome, homeIdOfAuth, homeOf, inAccount, newHome, tokenFile } from "./account.mjs"
@@ -20,8 +20,11 @@ import { ensureGeminiArrayItems } from "./array-items.mjs"
 import { expandToolSchema } from "./tool-schema.mjs"
 import { processExists } from "./proc.mjs"
 import { fitTools } from "./tool-budget.mjs"
-import { cloakUser, hint, outgoing, turnsAway } from "./cloak.mjs"
+import { cloakUser, DEFAULT_SLASH_COMMANDS, defuseSlashCommands, hint, outgoing, restoreSlashCommands, turnsAway } from "./cloak.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
+import { IMAGE_MODEL_ID, handleImageFetch, imageModelEntry, imageRoute } from "./image.mjs"
+import { reapOneshotChildren } from "./oneshot-acp.mjs"
+import { appGatewayOn as gatewayIn, gatewayFreeDir } from "./gateway-free.mjs"
 
 const PROVIDER_ID = "agy-cli"
 const PROVIDER_NAME = "Antigravity (local agy CLI)"
@@ -74,7 +77,6 @@ function maxParked() {
   return positiveTimeout(process.env.AGY_BRIDGE_MAX_PARKED, 256)
 }
 const EPHEMERAL_PARKED_MAX = 16
-const TOOLS_GROWN_CONTINUE_NOTE = "The tool results above have been delivered and the newly loaded tools are now available. Continue."
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
 const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
@@ -154,6 +156,7 @@ const THIRD_PARTY_CORE = "⚠ Third-party quota reached"
 const QUOTA_CORES = [QUOTA_CORE, THIRD_PARTY_CORE]
 const QUOTA_MARKERS = QUOTA_CORES.map((core) => "\n" + core)
 const quotaReached = (detail) => /\b(?:individual|third-party) quota reached\b/i.test(detail || "")
+const QUOTA_DETAIL_RE = /QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i
 const CREDITS_CORE = AGENT_ERROR_CORES[2]
 const VERIFY_CORE = AGENT_ERROR_CORES[5]
 const DISABLED_CORE = AGENT_ERROR_CORES[6]
@@ -429,8 +432,15 @@ export async function geminiDirArgs(agyPath, env = process.env) {
   // an account with a home of its own (account.mjs) keeps its sign-in in
   // a file under that home's .gemini, which agy reads only as its own
   if (currentHome()) return { args: [], dir: null }
-  const dir = bridgeGeminiDir(env)
-  if (!dir || (!env.AGY_BRIDGE_GEMINI_DIR && fileSignIn())) return { args: [], dir: null }
+  let dir = bridgeGeminiDir(env)
+  if (!dir || (!env.AGY_BRIDGE_GEMINI_DIR && fileSignIn())) {
+    // agy stays on its own ~/.gemini, unless the app's gateway is on there:
+    // then it gets that folder without the gateway (plugins#1591), or a
+    // turn, its listing and its quota would all be the gateway's
+    if (!appGatewayOn(os.homedir()) || !/--gemini[-_]dir\b/.test(await acpHelp(agyPath))) return { args: [], dir: null }
+    dir = gatewayFreeDir(os.homedir(), env)
+    return dir ? { args: ["--gemini-dir", dir], dir } : { args: [], dir: null }
+  }
   if (!/--gemini[-_]dir\b/.test(await acpHelp(agyPath))) return { args: [], dir: null }
   try {
     await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 })
@@ -486,29 +496,17 @@ function execOnce(file, args, opts = {}) {
   })
 }
 
-// Antigravity's desktop app keeps its gateway in ~/.gemini/config/config.json
-// ({"gateway":{"enabled":true,"url":…}}), and agy reads the same file: an agy
-// on ~/.gemini lists and serves the gateway's models, not the Google
-// account's. When magpie has wired the app to itself, that gateway is
-// magpie, so this provider listed magpie's own models and a turn would go
-// back into magpie (canlee886 on X, agy 1.5.10). agy acp on the bridge's own
-// folder (geminiDirArgs) reads no such file; `agy models` takes no
-// --gemini-dir, so with the app's gateway on, the catalog and the sign-in
-// check come from an agy acp session on that folder instead. A file that
-// can't be read as JSON counts as on: the session route is right either way.
+// Antigravity's desktop app keeps its gateway in ~/.gemini/config/config.json,
+// and agy reads the same file (gateway-free.mjs): an agy on ~/.gemini lists
+// and serves the gateway's models, not the Google account's. When magpie has
+// wired the app to itself, that gateway is magpie, so this provider listed
+// magpie's own models and a turn would go back into magpie (canlee886 on X,
+// agy 1.5.10). agy acp on the bridge's own folder (geminiDirArgs) reads no
+// such file; `agy models` takes no --gemini-dir, so with the app's gateway
+// on, the catalog and the sign-in check come from an agy acp session on that
+// folder instead.
 export function appGatewayOn(home = currentHome() ?? os.homedir()) {
-  let text
-  try {
-    text = fs.readFileSync(path.join(home, ".gemini", "config", "config.json"), "utf8")
-  } catch {
-    return false
-  }
-  try {
-    const gateway = JSON.parse(text)?.gateway
-    return gateway?.enabled === true
-  } catch {
-    return true
-  }
+  return gatewayIn(home)
 }
 
 // gatewayListed: `agy models` would answer from the app's gateway, and a
@@ -572,6 +570,38 @@ function noteRefusal(why) {
 
 function refusalOf() {
   return refusals.get(currentHome() ?? "") || ""
+}
+
+// An account Google disabled (agy's "This service has been disabled in
+// this account for violation of Terms of Service"), by the turn that said
+// so, and when: its requests are refused at once for a while, no agy
+// started, no session opened, nothing sent to Google. Each retry of a
+// request an account was refused on had started a new agy session, so
+// magpie's ten tries in a minute were ten new sessions at Google for a
+// suspended account (dmiedog, #1563). Ten minutes, not for good: an
+// account whose appeal is granted is asked again after them.
+const disabledHeld = new Map()
+const DISABLED_HOLD_MS = 10 * 60_000
+
+function holdDisabled(home) {
+  disabledHeld.set(home ?? "", Date.now())
+}
+
+// disabledNow is how long ago this account was found disabled, null when
+// it wasn't or the hold is over.
+function disabledNow(home) {
+  const at = disabledHeld.get(home ?? "")
+  if (at == null) return null
+  const ago = Date.now() - at
+  if (ago >= DISABLED_HOLD_MS) {
+    disabledHeld.delete(home ?? "")
+    return null
+  }
+  return ago
+}
+
+function isDisabledRefusal(error) {
+  return error?.statusCode === 403 && String(error.message ?? "").endsWith(ACCOUNT_DISABLED_REFUSED)
 }
 
 // refusalNow is the account's refusal, asking agy once when no listing of
@@ -836,6 +866,245 @@ function probeOfferedOnce(agyPath) {
   })
   ms().offeredProbePromise = probe
   return probe
+}
+
+// Web search, as agy itself searches (Kayphoon, magpie#7632): a session of
+// an agent whose one tool is agy's own search_web, asked for the query.
+// agy runs the search on its account's side (Google Search grounding) and
+// keeps what it found in the session's step output; the pages are read
+// from there and the turn is cancelled, so the model writes no answer of
+// its own. Nothing goes to Google but through agy (the retired antigravity
+// plugin's direct calls are what got accounts turned away).
+const SEARCH_AGENT = "magpie-web-search"
+const SEARCH_TIMEOUT_MS = 60_000
+
+function searchAgentDefinition() {
+  return [
+    "---",
+    `name: ${SEARCH_AGENT}`,
+    "description: Searches the web",
+    "mainAgent: true",
+    "subagent: false",
+    "tools: [search_web]",
+    "inheritMcp: false",
+    "inheritCustomizations: false",
+    "---",
+    "Call search_web once with the user's query, as it is. Then stop.",
+    "",
+  ].join("\n")
+}
+
+class SearchStatusError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+// pagesOfSearchWeb are the pages a search_web step output names: a summary
+// citing its sources as [n], then "Sources:" and a "[n] [title](url)" line
+// each. A page's text is what the summary says citing it, as plain text:
+// the lines that cite it fewest others first, up to PAGE_TEXT_CHARS, in the
+// summary's order (a long answer cites one source on most of its lines, so
+// every line would make every page the same). Code blocks are left out.
+// When no line cites any page, the first page has the summary.
+const PAGE_TEXT_CHARS = 600
+
+function plainLine(line) {
+  const cells = /^\s*\|.*\|\s*$/.test(line)
+    ? line.trim().slice(1, -1).split("|").map((c) => c.trim()).filter(Boolean)
+    : null
+  if (cells && cells.every((c) => /^:?-+:?$/.test(c))) return ""
+  return (cells ? cells.join(" · ") : line)
+    .replace(/\[\d+\]/g, "")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\*\*|__|`/g, "")
+    .replace(/(^|\s)\*(\S[^*]*\S|\S)\*(?=\s|[.,;:!?)]|$)/g, "$1$2")
+    .replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+\.\s+|>\s*)/, "")
+    .replace(/\s+/g, " ")
+    .replace(/\s+([.,;:!?])/g, "$1")
+    .trim()
+}
+
+export function pagesOfSearchWeb(output, count) {
+  const s = String(output ?? "").replace(/\r\n?/g, "\n")
+  const at = s.lastIndexOf("\nSources:\n")
+  if (at < 0) return []
+  const head = s.slice(0, at)
+  const said = head.match(/returned the following summary:\n/)
+  const summary = (said ? head.slice(said.index + said[0].length) : head).trim()
+  const pages = []
+  const byN = new Map()
+  for (const line of s.slice(at + "\nSources:\n".length).split("\n")) {
+    const m = line.trim().match(/^\[(\d+)\]\s*\[(.*)\]\((\S+)\)$/)
+    if (!m || byN.has(m[1])) continue
+    const page = { title: m[2].trim() || m[3], url: m[3], lines: [] }
+    byN.set(m[1], page)
+    pages.push(page)
+  }
+  const lines = []
+  let code = false
+  for (const raw of summary.split("\n")) {
+    if (/^\s*(```|~~~)/.test(raw)) { code = !code; continue }
+    if (code) continue
+    const text = plainLine(raw)
+    if (!text) continue
+    const ns = new Set([...raw.matchAll(/\[(\d+)\]/g)].map((m) => m[1]).filter((n) => byN.has(n)))
+    lines.push({ at: lines.length, text, ns })
+    for (const n of ns) byN.get(n).lines.push(lines.at(-1))
+  }
+  const cited = lines.some((l) => l.ns.size)
+  const limit = Number.isInteger(Number(count)) && Number(count) > 0 ? Number(count) : pages.length
+  const out = pages.slice(0, limit).map(({ title, url, lines: own }) => {
+    const kept = []
+    let used = 0
+    for (const l of [...own].sort((a, b) => a.ns.size - b.ns.size || a.at - b.at)) {
+      if (kept.length && used + l.text.length > PAGE_TEXT_CHARS) continue
+      if (kept.some((k) => k.text === l.text)) continue
+      kept.push(l)
+      used += l.text.length + 1
+    }
+    return { title, url, text: kept.sort((a, b) => a.at - b.at).map((l) => l.text).join("\n") }
+  })
+  if (!cited && out.length) out[0].text = lines.map((l) => l.text).join("\n").slice(0, PAGE_TEXT_CHARS * 2)
+  return out
+}
+
+// searchWebOutput is the step output of the search_web call a session made,
+// under <agy dir>/brain/<session>/.system_generated/steps (spilledOutput's
+// folder), "" until agy has written it.
+async function searchWebOutput(agyDir, sessionId) {
+  const steps = path.join(agyDir, "brain", sessionId, ".system_generated", "steps")
+  let names = []
+  try { names = await fs.promises.readdir(steps) } catch { return "" }
+  for (const name of names.sort((a, b) => Number(b) - Number(a))) {
+    let text = ""
+    try { text = await fs.promises.readFile(path.join(steps, name, "output.txt"), "utf8") } catch { continue }
+    if (/^The search for .* returned /m.test(text) && text.includes("\nSources:\n")) return text
+  }
+  return ""
+}
+
+// searchModel is the model a search session plans with: the lightest Flash
+// agy offers, else whatever the session has (the search itself runs on
+// agy's own search model).
+function searchModel(models) {
+  const ids = (Array.isArray(models?.availableModels) ? models.availableModels : [])
+    .map((m) => m?.modelId).filter((id) => typeof id === "string")
+  const flash = ids.filter((id) => /flash/i.test(id))
+  return flash.find((id) => /-(?:minimal|low)$/.test(id)) ?? flash[0] ?? null
+}
+
+async function agySearch({ query, count } = {}, ctx = {}) {
+  const q = typeof query === "string" ? query.trim() : ""
+  if (!q) throw new Error("query is required")
+  const { home: savedHome, email, given } = await accountOfAuth(ctx.getAuth)
+  const own = savedHome ? { home: savedHome } : ownChoice(email,
+    inAccount(null, () => storedSignInNow()) ?? (email ? await inAccount(null, () => storedSignIn()) : null), given)
+  if (own.refuse) throw new SearchStatusError(401, own.refuse)
+  return inAccount(own.home, () => searchAsAccount(q, count, email, ctx.abort))
+}
+
+async function searchAsAccount(query, count, email, abort) {
+  const agy = findAgy()
+  if (!agy) throw new SearchStatusError(503, "agy CLI not found on this machine")
+  const stored = storedSignInNow()
+  const notSignedIn = cannotSignIn(stored)
+  if (notSignedIn) throw new SearchStatusError(401, notSignedIn)
+  if (heldByAnother(stored, email)) throw new SearchStatusError(401, notHeldError(email))
+  const own = await geminiDirArgs(agy)
+  const agyDir = own.dir ? path.join(own.dir, "antigravity-cli")
+    : path.join(currentHome() || os.homedir(), ".gemini", "antigravity-cli")
+  let workspace = null
+  let child = null
+  let conn = null
+  let timer
+  let stop = () => {}
+  try {
+    workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-search-"))
+    const agentDir = path.join(workspace, ".agents", "agents", SEARCH_AGENT)
+    await fs.promises.mkdir(agentDir, { recursive: true })
+    await fs.promises.writeFile(path.join(agentDir, "agent.md"), searchAgentDefinition(), { mode: 0o600 })
+    const args = ["acp", "--agent", SEARCH_AGENT, ...await noDefaultCustomizationsArgs(agy), ...await telemetryArgs(agy), ...own.args]
+    child = spawnAgy(agy, args, { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true })
+    let stderr = ""
+    child.on("error", (error) => conn?.close(error))
+    child.on("close", () => conn?.close(new Error(`agy acp exited${stderr.trim() ? ": " + stderr.trim().slice(-500) : ""}`)))
+    child.stdin?.on("error", () => {})
+    child.stderr?.setEncoding?.("utf8")
+    child.stderr?.on?.("data", (d) => { stderr = (stderr + d).slice(-2000) })
+    let sessionId = null
+    let searched = null
+    const found = new Promise((resolve) => { searched = resolve })
+    conn = new AcpConnection(child, {
+      onNotification: (method, params) => {
+        const u = params?.update
+        if (method !== "session/update" || params?.sessionId !== sessionId || !u) return
+        if (u.sessionUpdate !== "tool_call" && u.sessionUpdate !== "tool_call_update") return
+        if (u.name === "search_web" && (u.status === "completed" || u.status === "failed")) searched(u.status)
+      },
+      // search_web asks no permission; anything else agy would run is refused
+      onRequest: async (method, params) => {
+        if (method !== "session/request_permission") throw Object.assign(new Error(`not served: ${method}`), { code: -32601 })
+        const options = Array.isArray(params?.options) ? params.options : []
+        const reject = options.find((o) => o?.kind === "reject_once") || options.find((o) => o?.kind === "reject_always")
+        return reject ? { outcome: { outcome: "selected", optionId: reject.optionId } } : { outcome: { outcome: "cancelled" } }
+      },
+      onProtocolError: (error) => conn.close(error),
+    })
+    const ended = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("agy's web search didn't answer in time")), SEARCH_TIMEOUT_MS)
+      timer.unref?.()
+      stop = () => reject(new Error("search cancelled"))
+      if (abort?.aborted) stop()
+      else abort?.addEventListener?.("abort", stop, { once: true })
+    })
+    ended.catch(() => {})
+    return await Promise.race([ended, (async () => {
+      const init = await conn.request("initialize", {
+        protocolVersion: 1,
+        clientInfo: CLIENT_INFO,
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+      })
+      const tooOld = agyTooOld(init?.agentInfo?.version ?? null)
+      if (tooOld) throw new SearchStatusError(503, tooOld)
+      let session
+      try {
+        session = await conn.request("session/new", { cwd: workspace, mcpServers: [] })
+      } catch (error) {
+        const said = error?.acpError?.message ?? error.message
+        if (/auth/i.test(said)) throw new SearchStatusError(401, `agy: ${said}`)
+        throw error
+      }
+      sessionId = session?.sessionId
+      if (!sessionId) throw new Error("agy session/new returned no sessionId")
+      const model = searchModel(session?.models)
+      if (model && model !== session?.models?.currentModelId) {
+        await conn.request("session/set_model", { sessionId, modelId: model }, 30_000).catch(() => {})
+      }
+      const turn = conn.request("session/prompt", { sessionId, prompt: [{ type: "text", text: defuseSlashCommands(`search_web: ${query}`) }] })
+      turn.catch(() => {})
+      const how = await Promise.race([found, turn.then(() => "ended", () => "ended")])
+      // agy writes the step's output as the step ends: a moment's room
+      let output = ""
+      for (let i = 0; i < 20 && !output; i++) {
+        output = await searchWebOutput(agyDir, sessionId)
+        if (!output) await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      if (how !== "ended") conn.notify("session/cancel", { sessionId })
+      if (!output) {
+        const why = how === "failed" ? "agy's search_web failed" : "agy didn't search the web"
+        throw new Error(stderr.trim() ? `${why}: ${stderr.trim().slice(-300)}` : why)
+      }
+      return pagesOfSearchWeb(output, count)
+    })()])
+  } finally {
+    clearTimeout(timer)
+    abort?.removeEventListener?.("abort", stop)
+    conn?.close(new Error("search done"))
+    if (child) killQuietly(child)
+    if (workspace) fs.promises.rm(workspace, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 function catalogOf(entry) {
@@ -1344,6 +1613,21 @@ class UnsupportedContent extends Error {
   constructor(what, hint) {
     super(`agy bridge: ${what} is not supported${hint ? `. ${hint}` : ""}`)
     this.statusCode = 400
+  }
+}
+
+// A new session's replay that would leave out or cut some of the
+// conversation, refused under AGY_BRIDGE_STRICT_REPLAY. "prompt is too
+// long" is the wording clients compact on.
+class ReplayTooLarge extends Error {
+  constructor(stats, budget, agentVersion) {
+    const old = !seedsHistory(agentVersion) && !/^(?:0|false|off|no)$/i.test(process.env.AGY_BRIDGE_SEED_REPLAY || "")
+    super(`prompt is too long: this conversation (${stats.bytes_before + (stats.turn_bytes ?? 0)} bytes) does not fit a new agy session ` +
+      `(${budget} bytes), and AGY_BRIDGE_STRICT_REPLAY is on, so nothing was sent. Compact the conversation or start a new one` +
+      (old ? `; agy ${agentVersion || "of this version"} takes one prompt only, agy ${SEED_MIN_AGY_VERSION} or newer takes a longer conversation over several` : "") + ".")
+    this.statusCode = 400
+    this.code = "context_length_exceeded"
+    this.noRetry = true
   }
 }
 
@@ -2306,6 +2590,7 @@ class Proc {
     // of the bridge's events (initialize, session/new, the model's options)
     this.phases = {}
     this.sessionPrompts = 0
+    this.seeding = false
     allProcs.add(this)
   }
 
@@ -2550,9 +2835,13 @@ class Proc {
         this.resumed = true
         this.hasSentFirstTurn = true
         this.expectedMessages = this.resumeFrom.expectedMessages.map((message) => ({ ...message }))
-      } catch {
+      } catch (error) {
+        // the RPC's error code only, for the session row (plugins#1495)
+        this.resumeFailure = Number.isInteger(error?.acpError?.code) ? `rpc_${error.acpError.code}` : "rpc_failed"
         session = null
       }
+    } else if (this.resumeFrom) {
+      this.resumeFailure = "unsupported"
     }
     if (!this.resumed) {
       session = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta })
@@ -2679,6 +2968,12 @@ class Proc {
     return tools.some((tool) => !known.has(tool.name))
   }
 
+  // The names toolsGrew found: declared by the client, not yet given to agy.
+  grownToolNames(tools) {
+    const known = new Set(this.tools.map((tool) => tool.name))
+    return tools.filter((tool) => !known.has(tool.name)).map((tool) => tool.name)
+  }
+
   // Swap the client tool catalog in place; agy re-lists on tools/list_changed.
   async updateTools(tools) {
     const signature = JSON.stringify(tools)
@@ -2709,7 +3004,7 @@ class Proc {
       // Anything that would run inside agy itself (shell, file edits,
       // questions, browser) is denied.
       const tool = ideToolOf(params?.toolCall)
-      if (tool && this.tools.some((t) => t.name === tool)) {
+      if (tool && !this.seeding && this.tools.some((t) => t.name === tool)) {
         const allow = (params?.options || []).find((option) => option?.kind === "allow_once")
         if (allow) return { outcome: { outcome: "selected", optionId: allow.optionId } }
       }
@@ -2724,13 +3019,25 @@ class Proc {
   }
 
   #onNotification(method, params) {
-    if (method !== "session/update" || params?.sessionId !== this.sessionId) return
+    if (method !== "session/update") return
+    if (params?.update?.sessionUpdate === "available_commands_update" &&
+      (!this.sessionId || params?.sessionId === this.sessionId) &&
+      Array.isArray(params.update.availableCommands)) {
+      this.slashCommands ??= new Set(DEFAULT_SLASH_COMMANDS)
+      for (const cmd of params.update.availableCommands) {
+        if (typeof cmd?.name === "string" && cmd.name) this.slashCommands.add(cmd.name)
+      }
+      return
+    }
+    if (params?.sessionId !== this.sessionId) return
     if (params.update?.sessionUpdate === "config_option_update" && Array.isArray(params.update.configOptions)) {
       this.configOptions = params.update.configOptions
       this.currentSelectionKey = null
       inAccount(this.home, () => noteOfferedModels(this.configOptions))
       return
     }
+    // a seed's prompt is history: whatever agy says to it goes nowhere
+    if (this.seeding) return
     const turn = this.turn
     if (!turn || turn.done || turn.finalized) return
     const update = params.update ?? {}
@@ -2769,7 +3076,7 @@ class Proc {
     return Math.max(1, estimateInputTokens(body) - this.omittedHistoryTokens)
   }
 
-  startTurn(content, messages, model, selection) {
+  startTurn(content, messages, model, selection, seeds = []) {
     if (this.dead) throw this.deadError
     if (this.retiring) throw new BusyError("agy bridge: this conversation's process is being retired")
     if (this.turn) throw new BusyError("agy bridge: this conversation still has an unfinished response")
@@ -2783,8 +3090,36 @@ class Proc {
     this.cancelledExpectedBase = null
     this.historyInvalid = false
     this.lastUsed = Date.now()
-    this.#runTurn(turn, content, model, selection).catch(() => {})
+    this.#runTurn(turn, content, model, selection, seeds).catch(() => {})
     return turn
+  }
+
+  // A replay too big for one prompt: each part but the last goes in as a
+  // prompt of its own, cancelled before the model answers it. agy keeps it
+  // in the session, so the real prompt, the last part, is read with all of
+  // them (SEED_MIN_AGY_VERSION). False when the turn was cancelled first.
+  async #seedHistory(turn, seeds) {
+    this.seeding = true
+    this.hasSentFirstTurn = true
+    try {
+      for (const parts of seeds) {
+        if (turn.cancelRequested || this.dead || this.stopping) return false
+        turn.arm()
+        this.sessionPrompts++
+        let ended = false
+        const reply = this.conn.request("session/prompt", { sessionId: this.sessionId, prompt: userTurnParts(parts, this.slashCommands) })
+        reply.then(() => { ended = true }, () => { ended = true })
+        while (!ended) {
+          await new Promise((resolve) => setTimeout(resolve, SEED_CANCEL_EVERY_MS))
+          if (!ended && !this.dead) this.conn.notify("session/cancel", { sessionId: this.sessionId })
+        }
+        await reply
+      }
+      await new Promise((resolve) => setTimeout(resolve, SEED_SETTLE_MS))
+      return !turn.cancelRequested
+    } finally {
+      this.seeding = false
+    }
   }
 
   matchesHistory(messages) {
@@ -2867,7 +3202,9 @@ class Proc {
   }
 
   recordToolResults(turn, messages) {
-    if (this.turn === turn) this.expectedMessages = messages.map((message) => ({ ...message }))
+    if (this.turn !== turn) return
+    this.expectedMessages = messages.map((message) => ({ ...message }))
+    parkStep(this)
   }
 
   recordAssistantResponse(turn, content) {
@@ -2876,10 +3213,23 @@ class Proc {
     }
   }
 
-  async #runTurn(turn, content, model, selection) {
+  async #runTurn(turn, content, model, selection, seeds = []) {
     try {
       turn.arm()
       if (model) await this.#setModel(model, selection)
+      if (seeds.length) {
+        let seeded = false
+        try {
+          seeded = await this.#seedHistory(turn, seeds)
+        } finally {
+          // a session holding part of the history is never continued
+          if (!seeded) this.historyInvalid = true
+        }
+        if (!seeded) {
+          turn.complete({ stopReason: "cancelled" })
+          return
+        }
+      }
       const stepUsageEnabled = this.stepUsageTrusted &&
         !/^(?:0|false|off|no|disabled)$/i.test(process.env.AGY_BRIDGE_STEP_USAGE || "")
       turn.stepsFile = stepUsageEnabled
@@ -2901,11 +3251,15 @@ class Proc {
           return
         }
         turn.arm()
-        unpark(this.convKey)
         this.hasSentFirstTurn = true
+        // the session is about to hold this turn's messages: a restart from
+        // here resumes at them (parkStep), never at the turn before
+        if (!parkStep(this)) unpark(this.convKey)
         // agy hands Antigravity the prompt as a user's turn, where Codex's
-        // GPT-5 lines are turned away too (cloak.mjs, USER_TURNED_AWAY)
-        promptParts = userTurnParts(promptParts)
+        // GPT-5 lines are turned away too (cloak.mjs, USER_TURNED_AWAY), and
+        // reads a command name anywhere in it as the user running that
+        // command (cloak.mjs, defuseSlashCommands)
+        promptParts = userTurnParts(promptParts, this.slashCommands)
         const promptNumber = turn.beginPrompt(promptParts, lateCalls)
         turn.promptInFlight = true
         this.sessionPrompts++
@@ -2975,9 +3329,13 @@ class Proc {
         turn.complete({ stopReason: "cancelled" })
         return
       }
+      if (isDisabledRefusal(error)) holdDisabled(this.home)
       if (error instanceof AgentTurnError && !this.dead && !turn.calls.length) {
         // agy kept the session; a retry of the same request continues in it.
         this.expectedMessages = turn.baseHistory
+        // the conversation's opening failed: its retry is that opening again,
+        // not a new conversation (#1563)
+        this.failedOpening = !turn.baseHistory.length
         turn.fail(error)
         return
       }
@@ -3035,7 +3393,7 @@ class Proc {
         "invalid_request_error",
       )
     }
-    if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i.test(detail) || quotaReached(detail)) {
+    if (QUOTA_DETAIL_RE.test(detail) || quotaReached(detail)) {
       return new AgentTurnError(
         `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}${refused429(detail) ? " — Antigravity answers this same bare 429 to a system prompt it turns away whatever quota is left, so if quota is left it is not a quota and waiting won't help: something in this agent's system prompt is being matched" : ""}`,
         "rate_limit_error",
@@ -3135,6 +3493,9 @@ class Proc {
     const name = message.name
     let args = message.arguments ?? {}
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("agy bridge: invalid tool arguments")
+    // what the model copied out of a prompt with a slash command defused
+    // goes to the client as the prompt's own text had it (cloak.mjs)
+    args = restoreSlashCommands(args, this.slashCommands)
     const tool = this.tools.find((item) => item.name === name)
     if (!tool) throw new Error(`agy bridge: undeclared tool ${name}`)
     const spilled = spilledOutput(this.agyDir, name, args)
@@ -3332,6 +3693,7 @@ class Proc {
   finalizeTurn(turn) {
     if (turn.finalized) return
     turn.finalized = true
+    const keepStep = this.keepsParkedStep(turn)
     turn.notifyAcpTools()
     for (const socket of turn.cancelledMcpSockets) {
       try { socket.destroy() } catch {}
@@ -3373,7 +3735,8 @@ class Proc {
         dropFromPool(this)
         this.stop().catch(() => {})
       } else if (!this.stopping && !this.retiring) {
-        park(this)
+        if (this.canPark()) park(this)
+        else if (!keepStep && this.sessionId) unparkSession(this.convKey, this.sessionId)
       }
     }
   }
@@ -3412,7 +3775,16 @@ class Proc {
     return this.stopPromise
   }
 
+  // The step parked mid-turn (parkStep) is gone with its turn: a turn the
+  // bridge ends answers its open calls with an error, and agy goes on past
+  // the step. Only an agy that died waiting for the client's results left
+  // its session as the step did, and their results go on in it.
+  keepsParkedStep(turn) {
+    return this.dead && !!turn?.hasPendingMcp()
+  }
+
   async #stop() {
+    if (this.turn && this.sessionId && !this.keepsParkedStep(this.turn)) unparkSession(this.convKey, this.sessionId)
     this.stopping = true
     this.turn?.fail(new Error("stopped"))
     this.#markDead(new Error("stopped"))
@@ -3534,10 +3906,12 @@ function toPromptParts(content) {
   return out
 }
 
-// userTurnParts is parts with each text part as cloakUser says
-function userTurnParts(parts) {
+// userTurnParts is parts with each text part as cloakUser says, and with
+// slashCommands (the session's, DEFAULT_SLASH_COMMANDS before it lists them)
+// defused
+function userTurnParts(parts, slashCommands) {
   return parts.map((part) => part?.type === "text" && typeof part.text === "string"
-    ? { ...part, text: cloakUser(part.text) }
+    ? { ...part, text: defuseSlashCommands(cloakUser(part.text), slashCommands) }
     : part)
 }
 
@@ -3734,7 +4108,8 @@ function trimParkedEntries(entries) {
   ephemeral.sort((a, b) => a.at - b.at)
   const keptStateful = stateful.slice(-limit)
   const remaining = Math.max(0, limit - keptStateful.length)
-  const keptEphemeral = ephemeral.slice(-Math.min(ephemeralCap, remaining))
+  const keepCount = Math.min(ephemeralCap, remaining)
+  const keptEphemeral = ephemeral.slice(Math.max(0, ephemeral.length - keepCount))
   return [...keptStateful, ...keptEphemeral].sort((a, b) => a.at - b.at)
 }
 
@@ -3770,6 +4145,35 @@ function unpark(convKey) {
 // instead of replaying history. Called after every completed turn and on retire.
 function park(proc) {
   if (!proc.canPark()) return
+  writeParked(proc, false)
+}
+
+// A turn in progress is parked too, at the history its session holds now:
+// the request's messages, once its prompt or a step's results went in.
+// magpie ends a plugin host in the middle of a tool loop (a recycle of a
+// host holding too much memory, an update), and the step's results then
+// reach a bridge with no live session. Before, nothing was parked during
+// a turn, so they opened a new session and the whole conversation went
+// in again, up to the model's window (chet030714 on X: a 5-hour window
+// gone in an hour); resumed, only the results go (renderResumedStepParts).
+// False when the session can't be continued from here.
+function parkStep(proc) {
+  if (proc.sideQuestion || proc.stateless || !proc.sessionId || !proc.hasSentFirstTurn || proc.historyInvalid || proc.dead || proc.stopping ||
+    proc.retiring || !proc.turn || !Array.isArray(proc.expectedMessages) || !proc.expectedMessages.length) return false
+  writeParked(proc, true)
+  return true
+}
+
+// Drop the conversation's parked entry when it is this session's: a turn
+// the bridge ends with a call still open answers it with an error, and agy
+// goes on from that in the session, past the step that was parked.
+function unparkSession(convKey, sessionId) {
+  loadParked()
+  const own = (entry) => entry?.key === convKey && entry.sessionId === sessionId
+  if (own(parked.get(convKey)) || readStateFile().some(own)) unpark(convKey)
+}
+
+function writeParked(proc, midTurn) {
   loadParked()
   parked.delete(proc.convKey)
   unparked.delete(proc.convKey)
@@ -3787,11 +4191,26 @@ function park(proc) {
     workDir: proc.workDir,
     workspace: proc.workspace,
     ...(isEphemeralProc(proc) ? { ephemeral: true } : {}),
+    ...(midTurn ? { midTurn: true, count: proc.expectedMessages.length } : {}),
     at: Date.now(),
   })
   const kept = trimParkedEntries([...parked.values()])
   parked.clear()
   for (const entry of kept) parked.set(entry.key, entry)
+  saveParked()
+}
+
+// A result can arrive under a changed work-directory key. Only the client
+// that received this batch has its bridge-issued tool call IDs.
+function stepCallHash(ids) {
+  return digest(JSON.stringify([...ids].sort()))
+}
+
+function rememberParkedCalls(proc, calls) {
+  const entry = parked.get(proc.convKey)
+  if (!entry?.midTurn || entry.sessionId !== proc.sessionId) return
+  entry.callsHash = stepCallHash(calls.map((call) => call.id))
+  entry.at = Date.now()
   saveParked()
 }
 
@@ -3804,70 +4223,110 @@ function resumeWorkspace(workspace) {
   return /^magpie-agy-bridge-[A-Za-z0-9]{6}$/.test(path.basename(resolved)) ? resolved : null
 }
 
-function parkedInstructionsMatch(entry, instructions) {
-  if (entry.instructionsHash === digest(sentInstructionsIdentity(instructions))) return true
-  if (!entry.workDir) return false
-  return entry.instructionsHash === digest(sentInstructionsIdentityWithWorkDir(instructions, entry.workDir))
-}
-
-function parkedHistoryMatches(entry, incoming, incomingSans, incomingIds) {
-  if (entry.historyHash === incoming) return true
-  // Sans-inputs resume needs the hashes written by current park(). Old
-  // entries without them still resume on an exact historyHash match only.
-  const idsOk = incomingIds != null && entry.toolUseIdentitiesHash === digest(incomingIds)
-  const sansOk = entry.historyHashSansInputs === incomingSans || entry.historyHash === incomingSans
-  return idsOk && sansOk
-}
-
-function parkedEntryCompatible(entry, opts, now) {
-  return now - entry.at <= RESUME_TTL_MS &&
-    parkedInstructionsMatch(entry, opts.instructions) &&
-    entry.userCloak === USER_CLOAK &&
-    entry.instructionsInSession === (systemAppend() && !!opts.instructions)
-}
-
-function takeParked(convKey, opts) {
+// A changed work directory or an older conversation key can leave the same
+// session under another key. Only take a unique compatible history in the
+// same account and client scope.
+function takeParked(convKey, opts, miss = {}) {
   loadParked()
+  let key = convKey
+  if (!parked.has(key) && opts.legacyConvKey && parked.has(opts.legacyConvKey)) key = opts.legacyConvKey
   const now = Date.now()
-  const incoming = digest(historyKey(opts.history))
-  const incomingSans = digest(historyKey(stripToolUseInputs(opts.history)))
-  const incomingIds = toolUseIdentitiesKey(opts.history)
-
-  let matchedKey = null
-  let entry = parked.get(convKey)
-  if (entry) {
-    matchedKey = convKey
-  } else if (Array.isArray(opts.history) && opts.history.length > 0) {
-    // conversationKey hashes callerWorkDir (plugins#1519), so a mid-session cd
-    // or an upgrade from pre-0.1.120 sessions.json changes convKey while
-    // instructions and history still identify the same parked session.
-    const account = /^(.*?)[0-9a-f]{64}$/.exec(convKey)?.[1]
-    if (account != null) {
-      let foundKey = null
-      let foundEntry = null
-      for (const [key, candidate] of parked) {
-        if (/^(.*?)[0-9a-f]{64}$/.exec(key)?.[1] !== account) continue
-        if (candidate.userId != null && candidate.userId !== (opts.userId || "")) continue
-        if (candidate.sessionScope != null && candidate.sessionScope !== (opts.sessionScope || "")) continue
-        if (!parkedEntryCompatible(candidate, opts, now)) continue
-        if (!parkedHistoryMatches(candidate, incoming, incomingSans, incomingIds)) continue
-        if (foundEntry) { foundKey = null; foundEntry = null; break }
-        foundKey = key
-        foundEntry = candidate
+  const hashes = new Map()
+  let currentHash, legacyHash
+  function match(entry, reason) {
+    reason.reason = now - entry.at > RESUME_TTL_MS ? "expired"
+      : entry.userCloak !== USER_CLOAK ? "user_cloak"
+      : entry.instructionsInSession !== (systemAppend() && !!opts.instructions) ? "instructions_place"
+      : null
+    if (reason.reason) return null
+    currentHash ??= digest(sentInstructionsIdentity(opts.instructions))
+    if (entry.instructionsHash !== currentHash &&
+      entry.instructionsHash !== (legacyHash ??= digest(sentInstructionsIdentity(opts.instructions, true))) &&
+      !(entry.workDir && [false, true].some((legacy) =>
+        entry.instructionsHash === digest(sentInstructionsIdentityWithWorkDir(opts.instructions, entry.workDir, legacy))))) {
+      reason.reason = "instructions"
+      return null
+    }
+    let history = opts.history
+    if (entry.midTurn || opts.resumeStep) {
+      if (!entry.midTurn || !opts.resumeStep || !Array.isArray(opts.messages) || !Number.isSafeInteger(entry.count) ||
+        entry.count < 1 || entry.count >= opts.messages.length || !answersStep(opts.messages.slice(entry.count))) {
+        reason.reason = "step"
+        return null
       }
-      matchedKey = foundKey
-      entry = foundEntry
+      history = opts.messages.slice(0, entry.count)
+    }
+    // The completed history and each parked prefix have their own hashes.
+    const historyKeyLength = entry.midTurn ? entry.count : -1
+    let incoming = hashes.get(historyKeyLength)
+    if (!incoming) {
+      incoming = { exact: digest(historyKey(history)) }
+      hashes.set(historyKeyLength, incoming)
+    }
+    if (entry.historyHash !== incoming.exact && !parkedHistoryMatchesSansInputs(entry, history, incoming)) {
+      reason.reason = "history"
+      return null
+    }
+    const workDir = entry.workDir == null ? null : (workDirectory(entry.workDir) ?? opts.workDir ?? null)
+    return { sessionId: entry.sessionId, expectedMessages: history, workspace: resumeWorkspace(entry.workspace), workDir, step: !!entry.midTurn }
+  }
+  let resume = null
+  if (parked.has(key)) {
+    resume = match(parked.get(key), miss)
+  } else {
+    miss.reason = "none"
+    const account = /^(.*?)[0-9a-f]{64}$/.exec(convKey)?.[1]
+    if (account == null || !opts.history?.length) return null
+    for (const [candidateKey, candidate] of parked) {
+      if (/^(.*?)[0-9a-f]{64}$/.exec(candidateKey)?.[1] !== account) continue
+      if (candidate.userId != null && candidate.userId !== (opts.userId || "")) continue
+      if (candidate.sessionScope != null && candidate.sessionScope !== (opts.sessionScope || "")) continue
+      if (candidate.midTurn && (!opts.stepCallsHash || candidate.callsHash !== opts.stepCallsHash)) continue
+      const compatible = match(candidate, {})
+      if (!compatible) continue
+      if (resume) return null
+      resume = compatible
+      key = candidateKey
+    }
+    if (!resume) return null
+    miss.reason = null
+  }
+  parked.delete(key)
+  unparked.add(key)
+  saveParked()
+  return resume
+}
+
+function parkedHistoryMatchesSansInputs(entry, history, incoming) {
+  if (incoming.sans === undefined) {
+    incoming.sans = digest(historyKey(stripToolUseInputs(history)))
+    const ids = toolUseIdentitiesKey(history)
+    incoming.ids = ids == null ? null : digest(ids)
+  }
+  return incoming.ids != null && entry.toolUseIdentitiesHash === incoming.ids &&
+    (entry.historyHashSansInputs === incoming.sans || entry.historyHash === incoming.sans)
+}
+
+// What follows a parked step: the model's calls (in the session already)
+// and the client's results for every one of them, nothing more.
+function answersStep(messages) {
+  let start = 0
+  while (start < messages.length && messages[start].role === "assistant") start++
+  if (start === 0 || start === messages.length) return false
+  if (messages.slice(start).some((message) => message.role === "assistant")) return false
+  const calls = new Set()
+  for (const message of messages.slice(0, start)) {
+    for (const block of Array.isArray(message.content) ? message.content : []) {
+      if (block?.type === "tool_use" && block.id) calls.add(block.id)
     }
   }
-  if (!entry || !matchedKey) return null
-  parked.delete(matchedKey)
-  unparked.add(matchedKey)
-  saveParked()
-  if (!parkedEntryCompatible(entry, opts, now)) return null
-  if (!parkedHistoryMatches(entry, incoming, incomingSans, incomingIds)) return null
-  const workspace = resumeWorkspace(entry.workspace)
-  const workDir = entry.workDir == null ? null : (workDirectory(entry.workDir) ?? opts.workDir ?? null)
-  return { sessionId: entry.sessionId, expectedMessages: opts.history, workspace, workDir }
+  const answered = new Set()
+  for (const message of messages.slice(start)) {
+    for (const block of Array.isArray(message.content) ? message.content : []) {
+      if (block?.type === "tool_result" && block.tool_use_id) answered.add(block.tool_use_id)
+    }
+  }
+  return calls.size > 0 && [...calls].every((id) => answered.has(id))
 }
 
 async function retire(key, proc) {
@@ -4052,6 +4511,8 @@ function matchesHistoryMessages(expected, actual) {
   if (historyKey(expected) === historyKey(actual)) return true
   if (sameHistoryUpToMasking(expected, actual)) return true
   if (droppedOneRequestText(expected, actual)) return true
+  if (droppedHoistedToolImages(expected, actual)) return true
+  if (droppedOneRequestReminder(expected, actual)) return true
   if (sameToolUseIdentities(expected, actual)) {
     const expectedStripped = stripToolUseInputs(expected)
     const actualStripped = stripToolUseInputs(actual)
@@ -4108,7 +4569,7 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
   // the new key (sorted, to avoid deadlock), then pick again inside those
   // locks. A process is re-keyed only when its current key is already held.
   let extra = null
-  const launch = !forceNew && !opts.unmatchedToolResults && isFreshConversation && statelessRequest(opts)
+  const launch = !forceNew && !opts.unmatchedToolResults && isFreshConversation && freshToolless(opts)
     ? await launchKey(agyPath, opts.workDir).catch(() => null) : null
   for (let attempt = 0; ; attempt++) {
     const keys = extra && extra !== convKey ? [convKey, extra] : [convKey]
@@ -4224,6 +4685,13 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     }
     const continuedFresh = isFreshConversation && existing.hasSentFirstTurn &&
       isContinuedOpening(existing, Array.isArray(opts.messages) ? opts.messages[0] : null)
+    // magpie trying again the opening whose turn failed: it goes on in the
+    // session that turn failed in, as a later turn's retry does, instead of
+    // a new session (and a new agy) per try. dmiedog's suspended account
+    // had five sessions a conversation in one failing minute (#1563). Only
+    // while the opening is unanswered: an answered one's session holds more
+    // than the empty history, so matchesHistory turns the next one away.
+    const retriedOpening = isFreshConversation && existing.failedOpening
     // Claude Code's compaction leaves the last exchange out of its history and
     // appends the summary instructions to that exchange's user message. The
     // live session has the whole conversation; a new one gets a replay cut to
@@ -4234,7 +4702,7 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     const compatible = !effectiveForceNew && !existing.dead && !existing.retiring &&
       workDirCompatible && sameInstructions(existing.instructions, opts.instructions) &&
       (!!cancelledMatch || existing.matchesHistory(matchedHistory) || continuedFresh || compactionFork || compacted)
-    if (compatible && (!(isFreshConversation && existing.hasSentFirstTurn) || continuedFresh || compacted)) {
+    if (compatible && (!(isFreshConversation && existing.hasSentFirstTurn) || continuedFresh || compacted || retriedOpening)) {
       if (continuedFresh) {
         const first = Array.isArray(opts.messages) ? opts.messages[0] : null
         // Snapshot the unsent tail before openingText advances to this turn.
@@ -4246,6 +4714,8 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       // agy never listed the tools this request declares (an agy started
       // with none whose MCP server never connected): a new one may.
       if (existing.toolsListed()) {
+        // A non-streaming, tool-less opening can still become a lasting chat.
+        if (matchedHistory.length || continuedFresh || compacted) existing.stateless = false
         if (cancelledMatch) logBridgeEvent(existing, null, "kept", "cancelled_turn_continuation", opts)
         if (compactionFork) logBridgeEvent(existing, null, "kept", "compaction_fork", opts)
         if (compacted) {
@@ -4259,16 +4729,22 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       }
       why = "tools_unlisted"
     } else {
+      // a new conversation that opens as this one did, with no turn
+      // before it, never went on from the session's history: no diff
+      const newOpening = isFreshConversation && existing.hasSentFirstTurn && !continuedFresh &&
+        Array.isArray(matchedHistory) && !matchedHistory.length
       why = effectiveForceNew ? "forced" : existing.dead ? "dead" : existing.retiring ? "retiring" :
         !workDirCompatible ? "work_dir" :
         !sameInstructions(existing.instructions, opts.instructions) ? "instructions" :
+        newOpening ? "fresh_after_first" :
         !(existing.matchesHistory(matchedHistory) || continuedFresh) ? "history" : "fresh_after_first"
       // where the history first differs from the session's, with no text,
       // as drop_live logs it (yetone/magpie#7223)
       if (why === "history") historyDiff = firstHistoryDiff(existing.expectedMessages, matchedHistory)
     }
-    if (!effectiveForceNew && launch && statelessRequest(opts) &&
-      statelessDonor(existing, launch, opts.userId || "", opts.sessionScope || "", opts.workDir)) {
+    if (!effectiveForceNew && launch && (statelessRequest(opts)
+      ? statelessDonor(existing, launch, opts.userId || "", opts.sessionScope || "", opts.workDir)
+      : why === "fresh_after_first" && sameOpeningDonor(existing, launch, opts))) {
       // the same stateless request again: its agy answers it in a new session
       return await reuseStateless(existing, key, opts, why)
     }
@@ -4277,11 +4753,14 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     await existing.stop().catch(() => {})
   }
   const forceNewFresh = forceNew || !!opts.unmatchedToolResults
-  if (!forceNewFresh && isFreshConversation && launch) {
+  if (!forceNewFresh && isFreshConversation && launch && statelessRequest(opts)) {
     const donor = findStatelessDonor(opts, launch)
     if (donor && lockedKeys.has(donor.convKey) && key === convKey) return await reuseStateless(donor, key, opts, "stateless_reuse")
   }
-  const resume = forceNewFresh || isFreshConversation ? null : takeParked(convKey, opts)
+  // a tool result whose live call is gone (a restarted host) may still go
+  // on in the session parked at its step (parkStep)
+  const parkMiss = { reason: isFreshConversation ? null : forceNewFresh && !opts.resumeStep ? "forced" : null }
+  const resume = isFreshConversation || (forceNewFresh && !opts.resumeStep) ? null : takeParked(convKey, opts, parkMiss)
   const launchWorkDir = resume && "workDir" in resume ? resume.workDir : opts.workDir
   // a spare runs in a folder of its own, and a resumed session needs its own
   const spare = resume?.workspace ? null : await takeSpare(agyPath, launchWorkDir)
@@ -4309,13 +4788,17 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
   // Why this request got a new agy session, so a cache that never hits can be
   // traced to the check that failed (#1058). Counts only, never content.
   proc.sessionReason = why
+  proc.resumedStep = !!(proc.resumed && resume?.step)
   logSessionEvent(proc, why, {
     fresh: !!isFreshConversation, resumed: !!proc.resumed, spare: !!spare,
     parked: !!resume, history: Array.isArray(opts.history) ? opts.history.length : null,
+    ...parkMiss.reason ? { park_miss: parkMiss.reason } : {},
+    ...resume && !proc.resumed ? { resume_failed: proc.resumeFailure ?? "unknown" } : {},
+    ...resume?.step ? { step: true } : {},
     ...historyDiff !== undefined ? { first_diff: historyDiff } : {},
     ...proc.phases,
   })
-  return { proc, history: opts.history }
+  return { proc, history: proc.resumedStep ? resume.expectedMessages : opts.history }
 }
 
 // Open a stateless request's session in an idle agy that answered one
@@ -4811,6 +5294,164 @@ function droppedOneRequestText(expected, actual) {
   return sameUpToMasking(cut, b)
 }
 
+// The one row in which expected and actual differ, both rows a user's, or
+// -1: the rows otherwise the same by same (masking, unless given).
+function oneDifferingUserRow(a, b, same = sameUpToMasking) {
+  if (a.length !== b.length) return -1
+  let row = -1
+  for (let index = 0; index < a.length; index++) {
+    if (same(a[index], b[index])) continue
+    if (row >= 0) return -1
+    row = index
+  }
+  if (row < 0 || a[row].role !== "user" || b[row].role !== "user") return -1
+  return row
+}
+
+// A user's text block that is only magpie's placeholder for an image it left
+// out, as a block of its own, so the key doesn't join it to the text beside it.
+const IMAGE_LEFT_OUT = "image_left_out"
+
+// The history as the key reads it (historyRows), each placeholder a user's
+// message has where an image was (isImagePlaceholder) an IMAGE_LEFT_OUT block.
+function slimmedHistoryRows(messages) {
+  return historyRows(messages.map((message) => message?.role !== "user" || !Array.isArray(message.content) ? message : {
+    ...message,
+    content: message.content.map((block) => block?.type === "text" && isImagePlaceholder(block.text)
+      ? { type: IMAGE_LEFT_OUT }
+      : block),
+  }))
+}
+
+function isLeftOutImage(block) {
+  return block?.type === IMAGE_LEFT_OUT || (block?.type === "text" && isImagePlaceholder(block.text))
+}
+
+// sameUpToMasking, but an image in a may stand in b as magpie's placeholder
+// for it: the gateway leaves out a history's oldest images first, every one it
+// needs to on that request (body_cap.go withoutOldImages), so the rows before
+// the hoisted one can lose theirs on the same request. Never the other way.
+function sameUpToSlimming(a, b) {
+  if (a?.type === "image" && isLeftOutImage(b)) return true
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((item, index) => sameUpToSlimming(item, b[index]))
+  }
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return sameUpToMasking(a, b)
+  const keysA = Object.keys(a).filter((key) => a[key] !== undefined).sort()
+  const keysB = Object.keys(b).filter((key) => b[key] !== undefined).sort()
+  return keysA.length === keysB.length && keysA.every((key, index) => key === keysB[index] && sameUpToSlimming(a[key], b[key]))
+}
+
+const withoutSpace = (text) => text.replace(/\s+/g, "")
+
+// Whether actual is expected but for images a tool returned that the client
+// hoisted into the tool result's user row for one request, and left out of
+// the history it stored (plugins#1556; OMP's 3 -> 1 and 7 -> 1 rows in
+// #1447): in one user row, each run of image and text blocks right after a
+// tool_result, when the run holds an image, is
+// - gone (3 -> 1);
+// - gone, its texts back in the tool_result's content after what it had,
+//   as text parts (3 -> 1, the caption folded back);
+// - only its images, each one magpie's placeholder for it, the texts gone
+//   (3 -> 2: the client kept the image and not its caption, and magpie's
+//   gateway left the image out under the provider's size cap).
+// Nothing else in the row changed, and the other rows are the same but for
+// masking and images magpie left out. A text run without an image, an image
+// anywhere else, an image kept without its caption, or a second changed row
+// is still a changed history.
+function droppedHoistedToolImages(expected, actual) {
+  if (!Array.isArray(expected) || !Array.isArray(actual)) return false
+  const a = slimmedHistoryRows(expected)
+  const b = slimmedHistoryRows(actual)
+  const row = oneDifferingUserRow(a, b, sameUpToSlimming)
+  if (row < 0) return false
+  const mine = a[row].content
+  const theirs = b[row].content
+  let hoisted = false
+  let at = 0
+  for (let index = 0; index < mine.length;) {
+    const block = mine[index++]
+    let end = index
+    while (block.type === "tool_result" && end < mine.length && (mine[end].type === "image" || mine[end].type === "text")) end++
+    const run = mine.slice(index, end)
+    const images = run.filter((item) => item.type === "image").length
+    if (!images) {
+      if (!sameUpToSlimming(block, theirs[at++])) return false
+      continue
+    }
+    hoisted = true
+    index = end
+    const result = theirs[at++]
+    if (result?.type !== "tool_result" || !Array.isArray(result.content) || result.content.length < block.content.length) return false
+    const had = result.content.slice(0, block.content.length)
+    if (!sameUpToSlimming(block, { ...result, content: had })) return false
+    const folded = result.content.slice(block.content.length)
+    if (folded.length) {
+      const texts = run.filter((item) => item.type === "text")
+      if (!texts.length || !folded.every((part) => part?.type === "text" && typeof part.text === "string")) return false
+      if (!sameTextUpToMasking(withoutSpace(folded.map((part) => part.text).join("")),
+        withoutSpace(texts.map((item) => item.text).join("")))) return false
+      continue
+    }
+    if (isLeftOutImage(theirs[at])) {
+      for (let left = 0; left < images; left++) {
+        if (!isLeftOutImage(theirs[at++])) return false
+      }
+    }
+  }
+  return hoisted && at === theirs.length
+}
+
+// Whether text is nothing but whole <system-reminder> and <system_message>
+// blocks, the wrappers a hook adds for one request. Linear, as
+// replaceClosedSystemReminders is.
+function wholeHookBlocks(text) {
+  let rest = String(text ?? "").trim()
+  if (!rest) return false
+  while (rest) {
+    const lower = asciiLower(rest)
+    const open = /^<(system-reminder|system_message)(?:\s[^>]*)?>/.exec(lower)
+    if (!open) return false
+    const close = new RegExp(`^</${open[1]}\\s*>`)
+    let at = open[0].length
+    for (;;) {
+      at = lower.indexOf(`</${open[1]}`, at)
+      if (at < 0) return false
+      const end = lower.indexOf(">", at)
+      if (end < 0) return false
+      if (close.test(lower.slice(at, end + 1))) {
+        rest = rest.slice(end + 1).trimStart()
+        break
+      }
+      at = end + 1
+    }
+  }
+  return true
+}
+
+// Whether actual is expected but for whole hook blocks (wholeHookBlocks) at
+// the end of expected's newest user row, which actual has without them, the
+// rest the same but for masking (plugins#1556). The row is the newest one
+// only: what a hook adds goes with one request. Any other text that went is
+// still a changed history.
+function droppedOneRequestReminder(expected, actual) {
+  if (!Array.isArray(expected) || !Array.isArray(actual)) return false
+  const a = historyRows(expected)
+  const b = historyRows(actual)
+  const row = oneDifferingUserRow(a, b)
+  if (row < 0 || a.slice(row + 1).some((item) => item.role === "user")) return false
+  const mine = a[row].content
+  const theirs = b[row].content
+  const last = mine.at(-1)
+  if (last?.type !== "text") return false
+  const kept = theirs.length === mine.length && theirs.at(-1).type === "text" ? theirs.at(-1).text : null
+  if (kept == null && theirs.length !== mine.length - 1) return false
+  if (kept != null && (kept === last.text || !last.text.startsWith(kept))) return false
+  if (!wholeHookBlocks(last.text.slice(kept?.length ?? 0))) return false
+  const cut = kept == null ? mine.slice(0, -1) : [...mine.slice(0, -1), { ...last, text: kept }]
+  return sameUpToMasking(cut, theirs)
+}
+
 function sameToolUseIdentities(left, right) {
   const a = toolUseIdentitiesKey(left)
   const b = toolUseIdentitiesKey(right)
@@ -4856,11 +5497,26 @@ function stripWorkDirNote(text) {
   return s.split(/(\n)/).map((part) => (part === "\n" || !WORK_DIR_NOTE_RE.test(part) ? part : "")).join("")
 }
 
-// System prompt and session instructions: billing headers, known agent
-// clock lines, and the bridge's own work-dir note (which changes when the
-// caller cds mid-session). User text is never passed through this helper.
-function stripVolatileSystem(text) {
-  return stripMagpiePlaceholderNotice(stripWorkDirNote(stripAgentClockLines(stripBillingHeader(text))))
+// Claude Code names its model in the system prompt ("You are powered by the
+// model agy-cli/gemini-4-hydrogen."), so /model rewrites that line. agy
+// switches models inside a session, so the line is not what makes a
+// conversation: with it in the identity a model switch opened a new session
+// and replayed the whole conversation (chet030714 on X). The session keeps
+// the line it was opened with. legacy keeps the line, as entries parked
+// before 0.1.143 were keyed, so they are still found once.
+const AGENT_MODEL_LINE_RE = /^(?:You are powered by the model (?:named [^\n]{1,80}?\. The exact model ID is \S{1,160}?|\S{1,160}?)\.(?:\s+Assistant knowledge cutoff is [^.\n]{1,40}\.)?|Assistant knowledge cutoff is [^.\n]{1,40}\.)$/
+
+function stripAgentModelLines(text) {
+  const s = String(text ?? "")
+  if (!s.includes("You are powered by the model") && !s.includes("Assistant knowledge cutoff is")) return s
+  return s.split(/(\n)/).map((part) => (part === "\n" || !AGENT_MODEL_LINE_RE.test(part.trim()) ? part : "")).join("")
+}
+
+// System prompt and session instructions: billing headers plus known agent
+// clock and model lines. User text is never passed through this helper.
+function stripVolatileSystem(text, legacy = false) {
+  const s = stripWorkDirNote(stripAgentClockLines(stripBillingHeader(text)))
+  return stripMagpiePlaceholderNotice(legacy ? s : stripAgentModelLines(s))
 }
 
 function instructionsIdentity(text) {
@@ -4885,16 +5541,16 @@ const USER_CLOAK = 1
 // before the field was written is not resumed: a new session gets them in
 // its first turn.
 
-function sentInstructionsIdentity(text) {
-  return compactIdentity(outgoing(stripVolatileSystem(text)))
+function sentInstructionsIdentity(text, legacy = false) {
+  return compactIdentity(outgoing(stripVolatileSystem(text, legacy)))
 }
 
 // Legacy parked entries (written before stripWorkDirNote was added to
 // stripVolatileSystem) hashed instructions with workDirNote(entry.workDir)
 // intact. Accepting that hash on resume avoids rebuilding compatible sessions
 // across the upgrade while still rejecting system prompt or outgoing() changes.
-function sentInstructionsIdentityWithWorkDir(text, workDir) {
-  const base = stripVolatileSystem(text)
+function sentInstructionsIdentityWithWorkDir(text, workDir, legacy) {
+  const base = stripVolatileSystem(text, legacy)
   if (!workDir) return compactIdentity(outgoing(base))
   const parts = []
   if (base.trim()) parts.push(base)
@@ -5180,8 +5836,30 @@ function findRemaskedProc(convKey, opts) {
 // no tools, no tool results and no earlier turns (an image described, a
 // title written). Any agy of the same launch can open a session for it.
 function statelessRequest(opts) {
-  return !!opts && opts.nonstream === true && !opts.tools?.length && !opts.hasToolResults &&
+  return !!opts && opts.nonstream === true && freshToolless(opts)
+}
+
+// No tools, no tool results and no earlier turns, streamed or not. magpie
+// streams every request it translates (a Chat or Responses client's
+// included), so a client's stream:false reaches the bridge as a stream.
+function freshToolless(opts) {
+  return !!opts && !opts.tools?.length && !opts.hasToolResults &&
     Array.isArray(opts.history) && !opts.history.length
+}
+
+// The idle agy of a conversation that opened as this fresh, tool-less
+// request does, for the request to open a session of its own in
+// (Proc.reuse): the same opening sent again is a new conversation, not
+// a history the live session lost (plugins#1592). That session is
+// closed, as it was stopped with its agy before; an agy that can't close
+// one is taken only when its session holds a single turn.
+function sameOpeningDonor(proc, launch, opts) {
+  return !!proc && !proc.dead && !proc.stopping && !proc.retiring && !proc.turn &&
+    (proc.closable || proc.sessionPrompts === 1) &&
+    !proc.resumed && proc.hasSentFirstTurn && !!proc.sessionId && !proc.tools?.length &&
+    proc.launchKey === launch && (proc.userId || "") === (opts.userId || "") &&
+    (proc.sessionScope || "") === (opts.sessionScope || "") && proc.workDir === opts.workDir &&
+    process.env.AGY_BRIDGE_STATELESS_REUSE !== "0"
 }
 
 // An idle agy whose only turn answered a stateless request, for another
@@ -5902,6 +6580,21 @@ function agentSummaryAsk(body) {
   return ask.startsWith("Describe your ") && ask.includes(" in 3-5 words")
 }
 
+// Claude Code appends this template to the main history after a turn. It
+// shares the main conversation key, but the client leaves the suggestion
+// exchange out of its next request. Sending it to ACP records that exchange
+// in expectedMessages and forces a history replay on the next real turn.
+// The template explicitly allows no suggestion ("Or nothing").
+function promptSuggestionAsk(body) {
+  const last = body.messages.at(-1)
+  if (last?.role !== "user") return false
+  const text = typeof last.content === "string" ? last.content
+    : Array.isArray(last.content) ? last.content.findLast((part) => part?.type === "text")?.text : null
+  if (typeof text !== "string") return false
+  const ask = text.trim()
+  return ask.startsWith("[SUGGESTION MODE:") && ask.includes("Reply with ONLY the suggestion")
+}
+
 // An agy runs under one account's sign-in (Proc.home), so a request of
 // another account never goes on in it, not even when its opening or tool
 // ids match: it would be answered with that account's credentials and
@@ -6037,9 +6730,9 @@ function requestSessionScope(fetchInput, init) {
 // approval-policy notice) but run in different folders are different
 // conversations; without it they share one agy session and each one's
 // request is refused while the other's response runs.
-function conversationKey(rawBody, sessionScope = "", workDir = "") {
+function conversationKey(rawBody, sessionScope = "", workDir = "", legacy = false) {
   const body = canonicalBody(rawBody)
-  const system = historyKey([{ role: "system", content: compactIdentity(stripVolatileSystem(systemText(body))) }])
+  const system = historyKey([{ role: "system", content: compactIdentity(stripVolatileSystem(systemText(body), legacy)) }])
   const first = body.messages?.[0]
   // Hash the whole stripped first message, including non-text blocks such as
   // images. A shared 8 KiB text prefix must not put two chats in one session.
@@ -6540,6 +7233,135 @@ function renderTurnMessagesParts(messages) {
 function maxInitialPromptBytes() {
   return positiveTimeout(process.env.AGY_BRIDGE_MAX_PROMPT_BYTES, 112 * 1024)
 }
+// A replay bigger than one prompt goes in as several (Proc#seedHistory):
+// agy keeps a prompt it was told to cancel before the model answered in the
+// session, so the model reads the whole history with the real prompt, the
+// last one. Checked on agy 1.5.17 with gemini-3.8-flash-low: 200 KB of
+// history as two cancelled prompts and a question, every marker read back,
+// and the history billed once, as the question's input. Before, a replay
+// was cut to 112 KiB, the model saw the newest turns only, and the context
+// shown was what was sent, not the conversation (yayoi_no_yume on X).
+// The budget is the model's window less its output and room for agy's own
+// prompt and the tools, at 2 bytes a token (English runs ~3.5, CJK ~3);
+// history past it is still left out, and the model is told.
+const SEED_MIN_AGY_VERSION = "1.5.17"
+// agy ignores a cancel that reaches it before the prompt, so it is sent
+// again until the prompt ends; the settle keeps a late one off the real prompt.
+const SEED_CANCEL_EVERY_MS = 25
+const SEED_SETTLE_MS = 150
+const SEED_CONTINUES = "\n[This message continues in the next one.]"
+const SEED_CONTINUED = "[Continued from the previous message.]\n"
+const REPLAY_ROOM_TOKENS = 32 * 1024
+const REPLAY_MAX_BYTES = 4 * 1024 * 1024
+const REPLAY_UNKNOWN_MODEL_BYTES = 384 * 1024
+
+// An agy too old to take a replay over several prompts cuts a long
+// conversation to one prompt's worth; say so once, where the user looks.
+let warnedSingleReplay = false
+function warnSingleReplay(agentVersion) {
+  if (warnedSingleReplay || /^(?:0|false|off|no)$/i.test(process.env.AGY_BRIDGE_SEED_REPLAY || "")) return
+  warnedSingleReplay = true
+  try {
+    process.stderr.write(`[agy-bridge] agy ${agentVersion || "(unknown version)"} takes a conversation into a new session in one prompt, ` +
+      `so a long one was cut; agy ${SEED_MIN_AGY_VERSION} or newer takes it over several prompts. Update agy (agy update).\n`)
+  } catch {}
+}
+
+function strictReplay() {
+  return /^(?:1|true|on|yes)$/i.test(process.env.AGY_BRIDGE_STRICT_REPLAY || "")
+}
+
+// Whether a replay's render left any of the conversation out or cut it.
+function replayLost(stats) {
+  return stats.messages_after < stats.messages_before || stats.clipped > 0 ||
+    stats.head_clipped || stats.turn_clipped || stats.prompt_clipped
+}
+
+function seedsHistory(version) {
+  if (/^(?:0|false|off|no)$/i.test(process.env.AGY_BRIDGE_SEED_REPLAY || "")) return false
+  const parse = (value) => {
+    const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(value ?? "").trim())
+    return match ? match.slice(1).map(Number) : null
+  }
+  const have = parse(version)
+  const need = parse(SEED_MIN_AGY_VERSION)
+  if (!have) return false
+  for (let i = 0; i < 3; i++) {
+    if (have[i] !== need[i]) return have[i] > need[i]
+  }
+  return true
+}
+
+// How much of a cold replay's text goes to agy, over as many prompts as it takes.
+function maxReplayBytes(...models) {
+  const set = process.env.AGY_BRIDGE_MAX_REPLAY_BYTES
+  if (set != null && set !== "" && Number.isFinite(Number(set)) && Number(set) >= 0) {
+    return Math.min(Math.floor(Number(set)), REPLAY_MAX_BYTES)
+  }
+  const limits = models.map((id) => (id ? modelLimits(String(id)) : undefined)).find(Boolean)
+  if (!limits) return REPLAY_UNKNOWN_MODEL_BYTES
+  return Math.max(0, Math.min(REPLAY_MAX_BYTES, (limits.context - limits.output - REPLAY_ROOM_TOKENS) * 2))
+}
+
+// The longest prefix of `text` within `limit` UTF-8 bytes, ending at a line
+// when one is in the last quarter, and never inside a surrogate pair.
+function textPrefixWithin(text, limit) {
+  if (utf8Bytes(text) <= limit) return text
+  let lo = 0
+  // a character is a byte at least: no prefix past `limit` characters fits
+  let hi = Math.min(text.length, Math.max(0, limit))
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (utf8Bytes(text.slice(0, mid)) <= limit) lo = mid
+    else hi = mid - 1
+  }
+  let end = lo
+  const code = text.charCodeAt(end - 1)
+  if (end > 0 && code >= 0xd800 && code <= 0xdbff) end--
+  const line = end > 0 ? text.lastIndexOf("\n", end - 1) : -1
+  if (line >= 0 && line + 1 >= Math.floor(end * 3 / 4)) end = line + 1
+  return text.slice(0, end)
+}
+
+// A prompt cut into prompts of at most `limit` text bytes each, markers
+// included; the last is the real prompt. Images stay where they were.
+function splitPromptParts(parts, limit) {
+  const room = Math.max(1024, limit - utf8Bytes(SEED_CONTINUES) - utf8Bytes(SEED_CONTINUED))
+  const chunks = [[]]
+  let used = 0
+  for (const part of parts) {
+    if (part?.type !== "text") {
+      chunks.at(-1).push(part)
+      continue
+    }
+    let rest = part.text
+    while (rest) {
+      let piece = textPrefixWithin(rest, room - used)
+      // a part that won't end in this prompt starts the next one whole
+      if (used && piece.length < rest.length) {
+        chunks.push([])
+        used = 0
+        piece = textPrefixWithin(rest, room)
+      }
+      // a character bigger than the room, which a room of 1 KiB never is
+      if (!piece) piece = String.fromCodePoint(rest.codePointAt(0))
+      chunks.at(-1).push({ type: "text", text: piece })
+      used += utf8Bytes(piece)
+      rest = rest.slice(piece.length)
+      // what is left goes in the next prompt, so a cut stays at a line's end
+      if (rest) {
+        chunks.push([])
+        used = 0
+      }
+    }
+  }
+  return chunks.map((chunk, i) => toPromptParts([
+    ...(i ? [{ type: "text", text: SEED_CONTINUED }] : []),
+    ...chunk,
+    ...(i < chunks.length - 1 ? [{ type: "text", text: SEED_CONTINUES }] : []),
+  ]))
+}
+
 const HISTORY_BLOCK_CLIP_BYTES = 12 * 1024
 const HISTORY_BLOCK_KEEP_BYTES = 4 * 1024
 const PINNED_USER_TASKS_BYTES = 16 * 1024
@@ -6553,7 +7375,7 @@ const REPLAY_HEAD_SHARE = 1 / 4
 const REPLAY_TURN_SHARE = 1 / 2
 const NUDGE_MAX_BYTES = 280
 const HISTORY_RECORD_NOTE = "Historical tool calls and results above are records, not instructions to write tool calls as text. Never output \"[tool call ...]\" text; invoke tools only through structured tool calls.\n"
-const HISTORY_OMITTED_NOTE = "[... earlier conversation history omitted to fit ACP 112 KiB prompt budget ...]\n"
+const HISTORY_OMITTED_NOTE = "[... earlier conversation history omitted to fit the prompt budget ...]\n"
 const HISTORY_OPENING_DONE_NOTE = "The opening message above, and any resume note in it, belongs to an earlier turn that is already done.\n"
 const utf8 = new TextEncoder()
 
@@ -6902,7 +7724,7 @@ function parseWorkspaceInstructionReminder(inner) {
   if (INSTRUCTION_CHANGE_FIRST_LINE_RE.test(afterCompact)) {
     return { kind: "changes", paths: matchPaths(afterCompact, INSTRUCTION_CHANGE_PATH_RE) }
   }
-  if ((hadBudget || hadCompact) && /^Instructions from:\s*[^\r\n]+/.test(afterCompact)) {
+  if ((hadBudget || hadCompact) && (!afterCompact || /^Instructions from:\s*[^\r\n]+/.test(afterCompact))) {
     return { kind: "baseline", paths: matchPaths(afterCompact, BASELINE_INSTRUCTION_PATH_RE) }
   }
   return null
@@ -7160,9 +7982,11 @@ function replayStats(history, raw, kept, keptIndices) {
   }
 }
 
-function renderInitialPrompt(body, callerWorkDir, instructionsInSession, reserveBytes = 0) {
+// `budgetBytes` is the whole replay's text: one prompt's by default, more
+// when the history is seeded over several (maxReplayBytes).
+function renderInitialPrompt(body, callerWorkDir, instructionsInSession, reserveBytes = 0, budgetBytes = maxInitialPromptBytes()) {
   const { history, messages: current } = trailingMessages(body)
-  const budget = Math.max(0, maxInitialPromptBytes() - reserveBytes)
+  const budget = Math.max(0, budgetBytes - reserveBytes)
   const head = []
   if (!instructionsInSession) {
     const system = systemText(body)
@@ -7396,12 +8220,21 @@ function renderInitialPrompt(body, callerWorkDir, instructionsInSession, reserve
     head_clipped: promptTextBytes(headParts) < promptTextBytes(head),
     turn_bytes: promptTextBytes(turn),
     turn_clipped: promptTextBytes(turn) < promptTextBytes(currentSegments),
+    prompt_clipped: promptTextBytes(out) > budget,
   }
   return { parts: promptTextBytes(out) <= budget ? out : clipPartsToBytes(out, budget), stats }
 }
 
 function renderContinuedTurnParts(messages) {
   return renderTurnMessagesParts(messages)
+}
+
+// A session resumed at a parked step (parkStep): it has the model's calls
+// already, so the results go in as late results do (renderLateResults),
+// with whatever else the client said after them.
+function renderResumedStepParts(messages) {
+  return mergePromptParts([{ type: "text", text: "Client tool calls that were still running have finished. Their real results:\n\n" }],
+    renderTurnMessagesParts(messages.filter((message) => message.role !== "assistant")))
 }
 
 function validateBody(body) {
@@ -7761,7 +8594,9 @@ function canReplayFollowUpAfterResults(body, rawResults) {
 function namedWorkDirectory(body, init) {
   const raw = new Headers(init.headers || {}).get("x-magpie-work-dir")
   if (raw) {
-    try { return decodeURIComponent(raw) } catch { return raw }
+    let named
+    try { named = decodeURIComponent(raw) } catch { named = raw }
+    return movedFromDirectory(body, named)
   }
   const firstAssistant = body.messages.findIndex((message) => message.role === "assistant")
   const opening = firstAssistant < 0 ? body.messages : body.messages.slice(0, firstAssistant)
@@ -7781,6 +8616,37 @@ function namedWorkDirectory(body, init) {
     }
   }
   return directory
+}
+
+// magpie names the folder the agent is in now. Claude Code says each move
+// in the conversation, "Primary working directory: /b (was /a)", so after a
+// `cd` the name changed while the conversation did not; the key, agy's
+// folder and the session's instructions all built on it, and every move
+// opened a new session and replayed the history (_paper_hands on X). The
+// conversation keeps the folder it began in, the first move's "was"; the
+// moves stay in its history, where the model reads where it is now.
+const MOVED_DIR_RE = /^(?: - )?Primary working directory: (.+) \(was (.+)\)$/gm
+
+function movedFromDirectory(body, named) {
+  let first = null
+  let last = null
+  const read = (text) => {
+    if (typeof text !== "string" || !text.includes(" (was ")) return
+    for (const match of text.matchAll(MOVED_DIR_RE)) {
+      first ??= match[2].trim()
+      last = match[1].trim()
+    }
+  }
+  const system = typeof body.system === "string" ? [body.system] : Array.isArray(body.system) ? body.system.map((block) => block?.text) : []
+  for (const text of system) read(text)
+  for (const message of Array.isArray(body.messages) ? body.messages : []) {
+    if (message?.role === "assistant") continue
+    if (typeof message?.content === "string") read(message.content)
+    else if (Array.isArray(message?.content)) {
+      for (const block of message.content) if (block?.type === "text") read(block.text)
+    }
+  }
+  return first && last === named ? first : named
 }
 
 // A directory as a prompt names it: bare, or quoted and ending a sentence
@@ -8357,6 +9223,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             }
             const usage = await settleUsage(proc, turn, step, responseContent)
             if (finished) return
+            rememberParkedCalls(proc, emittedCalls)
             stopMessage("tool_use", usage, false, step.usageKind === "agy_model_call")
             proc.recordAssistantResponse(turn, responseContent)
             if (toolResultStep && emittedCalls.length > 0 && proc.turn === turn &&
@@ -8587,19 +9454,18 @@ function streamResponse(proc, turn, body, signal, toolResultStep = null) {
   })
 }
 
-function replayToolStepResponse(last, body) {
+function bufferedAnthropicResponse(body, { msgId, model, content, stopReason }) {
   const encoder = new TextEncoder()
-  const content = structuredClone(last.content)
   const stream = new ReadableStream({
     start(controller) {
       const send = (event, data) => controller.enqueue(encoder.encode(sseEvent(event, data)))
       send("message_start", {
         type: "message_start",
         message: {
-          id: last.msgId,
+          id: msgId,
           type: "message",
           role: "assistant",
-          model: last.wireModel,
+          model,
           content: [],
           stop_reason: null,
           stop_sequence: null,
@@ -8662,14 +9528,14 @@ function replayToolStepResponse(last, body) {
       }
       send("message_delta", {
         type: "message_delta",
-        delta: { stop_reason: "tool_use", stop_sequence: null },
+        delta: { stop_reason: stopReason, stop_sequence: null },
         usage: { input_tokens: 0, output_tokens: 0 },
       })
       send("message_stop", { type: "message_stop" })
       controller.close()
     },
   })
-  if (body.stream === false) return jsonResponseFromStream(stream, last.wireModel, last.msgId)
+  if (body.stream === false) return jsonResponseFromStream(stream, model, msgId)
   return new Response(stream, { status: 200, headers: SSE_HEADERS })
 }
 
@@ -8677,6 +9543,11 @@ function replayToolStepResponse(last, body) {
 // when the user steered) are not sent again in the steer's prompt.
 // An answered result's images are the exception: the call got its text only
 // (textOnlyResult), so its images go in the prompt, under the result's id.
+// The prompt that goes on from a step ended for tools loaded mid-turn.
+function grownToolsNote(names) {
+  return `These tools were loaded and can be called now: ${names.join(", ")}. Continue the task.`
+}
+
 function withoutAnswered(messages, answered) {
   if (!answered?.size) return messages
   return messages.map((message) => message.role === "user" && Array.isArray(message.content)
@@ -8688,32 +9559,59 @@ function withoutAnswered(messages, answered) {
     : message)
 }
 
-async function beginTurn(proc, history, body, callerWorkDir, model, selection, answered, toolsGrewContinuation = false) {
+async function beginTurn(proc, history, body, callerWorkDir, model, selection, answered, grownTools = null) {
   const reminder = outputFormatReminder(body)
   const flattened = proc.pendingFlattenedTurn
   proc.pendingFlattenedTurn = null
   const isFirstTurn = !proc.hasSentFirstTurn
   let baseParts
-  if (!isFirstTurn) {
+  let replay = null
+  if (!isFirstTurn && proc.resumedStep) {
+    proc.resumedStep = false
+    baseParts = renderResumedStepParts(body.messages.slice(history.length))
+  } else if (!isFirstTurn) {
     baseParts = renderContinuedTurnParts(flattened
       ? [flattened, ...body.messages.slice(1)]
       : withoutAnswered(body.messages.slice(history.length), answered))
-    const hasUserSubstance = baseParts.some((part) =>
-      part?.type === "image" || (part?.type === "text" && !isMetaOnlyUserText(part.text)))
-    if (!hasUserSubstance && (toolsGrewContinuation || (!baseParts.length && answered?.size))) {
-      baseParts = mergePromptParts(baseParts, [{ type: "text", text: TOOLS_GROWN_CONTINUE_NOTE }])
-    }
+    // a step ended for tools loaded mid-turn: its results are in, so the
+    // prompt says what can be called now and to go on
+    if (grownTools?.length) baseParts = mergePromptParts([{ type: "text", text: grownToolsNote(grownTools) }], baseParts)
+    else if (!baseParts.length && answered?.size) baseParts = [{ type: "text", text: "The tool results above have been delivered. Continue." }]
   } else {
+    // A history bigger than one prompt goes in over several (seedHistory),
+    // up to the model's window, where agy can take them.
+    const budget = seedsHistory(proc.agentVersion) ? Math.max(maxInitialPromptBytes(), maxReplayBytes(model, selection?.model)) : maxInitialPromptBytes()
     const initial = renderInitialPrompt(body, callerWorkDir, proc.instructionsInSession,
-      reminder.length ? promptTextBytes(reminder) + 2 : 0)
+      reminder.length ? promptTextBytes(reminder) + 2 : 0, budget)
     baseParts = initial.parts
-    // what a replay into a new session kept, in counts (plugins#1401)
-    if (initial.stats.messages_before) {
-      logSessionEvent(proc, proc.sessionReason ?? null, { ...initial.stats, prompt_bytes: promptTextBytes(baseParts) }, "replay")
+    if (initial.stats.messages_before) replay = { ...initial.stats, prompt_bytes: promptTextBytes(baseParts), budget_bytes: budget }
+    // AGY_BRIDGE_STRICT_REPLAY=1: a new session gets the whole conversation
+    // or nothing, never a shortened one the model answers from as if whole
+    // (plugins#1495)
+    if (strictReplay() && replayLost(initial.stats)) {
+      logSessionEvent(proc, proc.sessionReason ?? null, { ...replay ?? initial.stats, budget_bytes: budget,
+        seeded: seedsHistory(proc.agentVersion), agy_version: proc.agentVersion ?? null }, "replay_refused")
+      dropFromPool(proc)
+      await proc.stop().catch(() => {})
+      throw new ReplayTooLarge(initial.stats, budget, proc.agentVersion)
     }
   }
-  const contentParts = mergePromptParts(baseParts, reminder)
-  if (promptHasImage(contentParts) && !proc.supportsImages) {
+  let contentParts = mergePromptParts(baseParts, reminder)
+  let seeds = []
+  // a later turn too: a pasted log over 128 KiB was cut by agy
+  if (seedsHistory(proc.agentVersion) && promptTextBytes(contentParts) > maxInitialPromptBytes()) {
+    const chunks = splitPromptParts(contentParts, maxInitialPromptBytes())
+    seeds = chunks.slice(0, -1)
+    contentParts = chunks.at(-1)
+  }
+  // what a replay into a new session kept, in counts (plugins#1401)
+  if (replay) {
+    const seeded = seedsHistory(proc.agentVersion)
+    logSessionEvent(proc, proc.sessionReason ?? null, { ...replay, prompts: seeds.length + 1, seeded,
+      agy_version: proc.agentVersion ?? null }, "replay")
+    if (!seeded && replayLost(replay)) warnSingleReplay(proc.agentVersion)
+  }
+  if ((promptHasImage(contentParts) || seeds.some(promptHasImage)) && !proc.supportsImages) {
     if (isFirstTurn) {
       dropFromPool(proc)
       await proc.stop().catch(() => {})
@@ -8735,13 +9633,14 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, a
     const sessionOverhead = (proc.instructionsInSession && body.system
       ? estimateInputTokens({ system: body.system, messages: [] })
       : 0) + (Array.isArray(body.tools) && body.tools.length ? estimateTextTokens(JSON.stringify(body.tools)) : 0)
-    const sentEstimate = Math.max(1, sessionOverhead + estimatePromptPartsTokens(contentParts))
+    const sentEstimate = Math.max(1, sessionOverhead + estimatePromptPartsTokens(contentParts) +
+      seeds.reduce((sum, parts) => sum + estimatePromptPartsTokens(parts), 0))
     const clipThreshold = Math.min(HISTORY_BLOCK_CLIP_BYTES, maxInitialPromptBytes())
     const promptClipped = utf8Bytes(JSON.stringify(body.messages)) > clipThreshold &&
       rawEstimate > sentEstimate + 64
     proc.omittedHistoryTokens = promptClipped ? rawEstimate - sentEstimate : 0
   }
-  return proc.startTurn(contentParts, body.messages, model, selection)
+  return proc.startTurn(contentParts, body.messages, model, selection, seeds)
 }
 
 // A magpie that installs a plugin's CLI (auth.cli) installs agy before it
@@ -8763,6 +9662,18 @@ async function signedInAs(homeId = "") {
     forgetStoredSignIn()
     await keepOwn(email, await storedSignIn())
   }
+  // Beside another account of agy's own, it would share agy's one keyring
+  // with it, and whichever account agy holds would answer for both
+  // (#1599): it gets a home of its own, with a copy of the sign-in.
+  if (!homeId && anotherOwn(email)) {
+    const account = await homeForOwn(email)
+    if (!account) {
+      return { type: "failed", error: `agy is signed in to ${email || "a Google account"}, and another account here uses ` +
+        `agy's sign-in already. Add it with "Add another Google account" instead, so each has a sign-in of its own.` }
+    }
+    homeId = account.id
+  }
+  if (!homeId) ownSeen.add(ownKey(email))
   const metadata = { ...(email ? { email } : {}), ...(homeId ? { agyHome: homeId } : {}) }
   return { type: "success", key: homeId ? `agy:${homeId}` : "agy", ...(Object.keys(metadata).length ? { metadata } : {}) }
 }
@@ -8858,11 +9769,12 @@ async function importSignIns(texts) {
   return out
 }
 
-// homeOfAuth is the home of the account a saved sign-in is, null for
-// agy's own.
-async function homeOfAuth(getAuth) {
-  const { home, email } = await accountOfAuth(getAuth)
-  return home ?? ownHome(email, inAccount(null, () => storedSignInNow()))
+// ownOfAuth is where the account a saved sign-in is runs (ownChoice),
+// after the first keyring read, as a request waits for it.
+async function ownOfAuth(getAuth) {
+  const { home, email, given } = await accountOfAuth(getAuth)
+  return home ? { home } : ownChoice(email,
+    inAccount(null, () => storedSignInNow()) ?? (email ? await inAccount(null, () => storedSignIn()) : null), given)
 }
 
 // ownHome is where an account of agy's own (saved as email) runs, given
@@ -8875,8 +9787,41 @@ async function homeOfAuth(getAuth) {
 function ownHome(email, stored) {
   if (!email) return null
   if (heldByAnother(stored, email) || stored?.state === "unreachable") return keptFor(email)
+  // agy's sign-in can't say whose it is (#1599): the account's own kept
+  // sign-in, never one that may be another account's
+  if (ownerUnknown(stored)) return keptFor(email)
   inAccount(null, () => keepOwn(email, stored)).catch(() => {})
   return null
+}
+
+// ownChoice is ownHome as { home }, with refuse, why the account can't run,
+// when its home would be agy's own and agy's sign-in may be another
+// account's: held by another, or whose it is unknown while another account
+// of agy's own is here (#1599). A lone account of agy's own runs as agy's
+// sign-in when it can't be told, as it always did: it is the only one that
+// sign-in can be. given is false when no account was named at all
+// (OpenCode's catalog, a request without a sign-in): agy's own, as before.
+function ownChoice(email, stored, given = true) {
+  const home = ownHome(email, stored)
+  if (home) return { home }
+  if (email && heldByAnother(stored, email)) return { home: null, refuse: notHeldError(email) }
+  if ((email ? ownerUnknown(stored) : given) && anotherOwn(email)) return { home: null, refuse: unknownOwnerError(email) }
+  return { home: null }
+}
+
+// The accounts of agy's own this host was asked for (ownKey).
+const ownSeen = new Set()
+
+function ownKey(email) {
+  return whoOf(email) || "unnamed"
+}
+
+// anotherOwn says another account of agy's own than email is here: one
+// this host was asked for, or one kept (keptOthers).
+function anotherOwn(email) {
+  const me = ownKey(email)
+  for (const k of ownSeen) if (k !== me) return true
+  return keptOthers(email)
 }
 
 // accountOfAuth is homeOfAuth, with the email an account of agy's own was
@@ -8886,7 +9831,16 @@ async function accountOfAuth(getAuth) {
   try { auth = typeof getAuth === "function" ? await getAuth() : getAuth } catch {}
   const home = homeOf(homeIdOfAuth(auth))
   const email = !home && typeof auth?.metadata?.email === "string" ? auth.metadata.email.trim() : ""
-  return { home, email }
+  if (!home && auth) ownSeen.add(ownKey(email))
+  return { home, email, given: Boolean(auth) }
+}
+
+// usageGeminiDir is the folder agy -p /usage reads in place of ~/.gemini:
+// none while the app's gateway is off there, else the one a turn's agy acp
+// gets (geminiDirArgs), with no gateway in it (plugins#1591).
+async function usageGeminiDir(agy) {
+  if (!appGatewayOn()) return { gateway: false, dir: null }
+  return { gateway: true, dir: (await geminiDirArgs(agy)).dir }
 }
 
 // One usage reader per account: each holds its own last report.
@@ -8897,14 +9851,16 @@ const toldNotHeld = new Set()
 function readUsageOf(home, email = "") {
   const key = home ?? ""
   let read = usageReaders.get(key)
-  if (!read) usageReaders.set(key, (read = createUsageReader(findAgy)))
+  if (!read) usageReaders.set(key, (read = createUsageReader(findAgy, { geminiDir: usageGeminiDir })))
   return inAccount(home, async () => {
     if (email) {
       let stored = null
       try { stored = await storedSignIn() } catch {}
-      // out of reach: read with the sign-in kept for it, when there is one
-      const kept = stored?.state === "unreachable" ? keptFor(email) : null
+      // out of reach, or agy's sign-in can't say whose it is (#1599): read
+      // with the sign-in kept for it, when there is one
+      const kept = stored?.state === "unreachable" || ownerUnknown(stored) ? keptFor(email) : null
       if (kept) return readUsageOf(kept)
+      if (ownerUnknown(stored) && anotherOwn(email)) return { windows: [], error: unknownOwnerError(email), signIn: "expired" }
       if (heldByAnother(stored, email)) {
         // kept while agy held it: read with its own sign-in
         const kept = keptFor(email)
@@ -8928,6 +9884,11 @@ function readUsageOf(home, email = "") {
 export const AntigravityBridgePlugin = async () => {
   keepAgyCurrent(findAgy)
   return {
+    // magpie's web search (Settings › Models › Web search), as the signed-in
+    // account, through agy's own search_web; OpenCode ignores it
+    search: {
+      agy: { name: "Antigravity (agy)", auth: PROVIDER_ID, execute: agySearch },
+    },
     auth: {
       provider: PROVIDER_ID,
       // Magpie's hook for the CLI a plugin runs through: a sign-in on a
@@ -8945,7 +9906,10 @@ export const AntigravityBridgePlugin = async () => {
       },
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
       usage: async (getAuth) => {
-        const { home, email } = await accountOfAuth(getAuth)
+        const { home, email, given } = await accountOfAuth(getAuth)
+        // saved without its email, beside another account of agy's own:
+        // whose agy's sign-in is can't be told for it (#1599)
+        if (given && !home && !email && anotherOwn("")) return { windows: [], error: unknownOwnerError(""), signIn: "expired" }
         return readUsageOf(home, email)
       },
       // magpie's "Import accounts from a file…" (OpenCode ignores it): the
@@ -8997,16 +9961,18 @@ export const AntigravityBridgePlugin = async () => {
       loader: async (getAuth) => {
         // the account's own home, null for agy's own sign-in: every agy
         // its requests run is started there
-        const { home: savedHome, email } = await accountOfAuth(getAuth)
+        const { home: savedHome, email, given } = await accountOfAuth(getAuth)
         return {
           baseURL: "agy://local",
           apiKey: "agy",
           // an account of agy's own runs in its kept home while agy holds
-          // another (ownHome), from the last keyring read
-          // (none yet after a start: it is waited for, so the first
-          // request isn't sent as the account agy holds)
-          fetch: async (fetchInput, init = {}) => inAccount(savedHome ?? ownHome(email,
-            inAccount(null, () => storedSignInNow()) ?? (email ? await inAccount(null, () => storedSignIn()) : null)), async () => {
+          // another, or can't say whose its sign-in is (ownChoice), from the
+          // last keyring read (none yet after a start: it is waited for, so
+          // the first request isn't sent as the account agy holds)
+          fetch: async (fetchInput, init = {}) => {
+           const own = savedHome ? { home: savedHome } : ownChoice(email,
+             inAccount(null, () => storedSignInNow()) ?? (email ? await inAccount(null, () => storedSignIn()) : null), given)
+           return inAccount(own.home, async () => {
             const home = currentHome()
             const requestUrl = typeof fetchInput === "string"
               ? fetchInput
@@ -9048,6 +10014,29 @@ export const AntigravityBridgePlugin = async () => {
             if (heldByAnother(stored, email)) {
               return jsonError(401, notHeldError(email), undefined, { headers: { "X-Magpie-Sign-In": "expired" } })
             }
+            // or one whose sign-in may be another account's (#1599)
+            if (own.refuse) {
+              return jsonError(401, own.refuse, undefined, { headers: { "X-Magpie-Sign-In": "expired" } })
+            }
+            const disabledAgo = disabledNow(home)
+            if (disabledAgo != null) {
+              logBridgeEvent(null, null, "refuse_held", "account_disabled", {}, { held_ms: disabledAgo })
+              return jsonError(403, `agy bridge: ${ACCOUNT_DISABLED_REFUSED}`, undefined, { headers: NO_RETRY_HEADERS })
+            }
+            const imgKind = imageRoute(requestUrl)
+            if (imgKind) {
+              return handleImageFetch(imgKind, fetchInput, init, {
+                agyPath: agy,
+                agyTooOld,
+                clientInfo: CLIENT_INFO,
+                noDefaultCustomizationsArgs,
+                telemetryArgs,
+                geminiDirArgs,
+                refusalNow,
+                classifyAgyFailure,
+                jsonError,
+              })
+            }
             let body
             try {
               const raw = init.body != null
@@ -9061,11 +10050,24 @@ export const AntigravityBridgePlugin = async () => {
 
             const rawModel = body.model || ""
             const requestedModel = (rawModel.includes("/") ? rawModel.split("/").pop() : rawModel).replace(/\[1m\]$/i, "")
+            const skipSuggestion = promptSuggestionAsk(body)
             // One canonical form for both opening-system layouts, before anything
             // derives a key, instructions or history from the body.
             const layout = requestLayout(body)
             body = { ...foldSplitCalls(canonicalBody(body)), model: requestedModel }
             if (isOrchestrator(requestedModel)) return jsonError(400, orchestratorRefusal(requestedModel), undefined, { noRetry: true })
+            const sessionScope = requestSessionScope(fetchInput, init) +
+              (requestHeader(fetchInput, init, "x-magpie-subagent") && agentSummaryAsk(body) ? AGENT_SUMMARY_SCOPE : "")
+            // an account's conversations are its own: its agy has them
+            const callerWorkDir = namedWorkDirectory(body, init)
+            const baseConvKey = (home ? `acct:${path.basename(home)}:` : "") + conversationKey(body, sessionScope, callerWorkDir || "")
+            if (skipSuggestion) {
+              logSessionEvent({ convKey: baseConvKey }, "prompt_suggestion", {}, "suggestion_skipped")
+              return bufferedAnthropicResponse(body, {
+                msgId: "msg_" + randomUUID().replace(/-/g, "").slice(0, 24),
+                model: rawModel, content: [], stopReason: "end_turn",
+              })
+            }
             const saidEffort = requestHeader(fetchInput, init, "x-magpie-effort")
             const listed = await loadModelCatalog(agy)
             const model = resolveAgyModel(listed, requestedModel, body, saidEffort)
@@ -9076,16 +10078,14 @@ export const AntigravityBridgePlugin = async () => {
               return jsonError(400, `agy bridge: model ${requestedModel} is unavailable to this agy account; another signed-in agy account lists it`)
             }
             const selection = { model: requestedModel, effort: requestedEffort(body, saidEffort) }
-            const sessionScope = requestSessionScope(fetchInput, init) +
-              (requestHeader(fetchInput, init, "x-magpie-subagent") && agentSummaryAsk(body) ? AGENT_SUMMARY_SCOPE : "")
             const reqId = "req_" + randomBytes(4).toString("hex")
-            const callerWorkDir = namedWorkDirectory(body, init)
+            // the key before the model line left it (0.1.142 and older)
+            const legacyConvKey = (home ? `acct:${path.basename(home)}:` : "") + conversationKey(body, sessionScope, callerWorkDir || "", true)
             const trailing = trailingMessages(body)
             const sideQuestion = isSideQuestionTurn(trailing.messages)
             // an account's conversations are its own: its agy has them;
             // /btw side questions run in an isolated ephemeral key so they
             // never mutate or block the main conversation's live session.
-            const baseConvKey = (home ? `acct:${path.basename(home)}:` : "") + conversationKey(body, sessionScope, callerWorkDir || "")
             const convKey = sideQuestion ? `${baseConvKey}#btw:${reqId}` : baseConvKey
             const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
@@ -9116,12 +10116,13 @@ export const AntigravityBridgePlugin = async () => {
               }
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false, reqId, convKey,
+                legacyConvKey: legacyConvKey !== convKey ? legacyConvKey : "",
                 hasToolResults: resultBlocks.length > 0, compaction: isCompactionTurn(trailing.messages),
                 sideQuestion, userId: body.metadata?.user_id || "", sessionScope }
               let answeredIds = null
-              let toolsGrewContinuation = false
-              const begin = (proc, history, extraAnswered) =>
-                beginTurn(proc, history, body, callerWorkDir, model, selection, extraAnswered ?? answeredIds, toolsGrewContinuation)
+              // tools the steered prompt names as callable now (grown mid-turn)
+              let grownTools = null
+              const begin = (proc, history, extraAnswered) => beginTurn(proc, history, body, callerWorkDir, model, selection, extraAnswered ?? answeredIds, grownTools)
               let keptSession = false
               if (resultBlocks.length && !sideQuestion) {
                 const matches = matchToolResults(body, resultBlocks, sessionScope)
@@ -9206,20 +10207,31 @@ export const AntigravityBridgePlugin = async () => {
                       turn.arm()
                       proc.lastUsed = Date.now()
                       logBridgeEvent(proc, turn, "replay_tool_step", "idempotent_retry", acquireOpts, { calls: replay.emittedCalls.length })
-                      return replayToolStepResponse(replay, body)
+                      return bufferedAnthropicResponse(body, {
+                        msgId: replay.msgId, model: replay.wireModel, content: replay.content, stopReason: "tool_use",
+                      })
                     }
                   }
-                  // A steer (or grown tool catalog) keeps the live session, so
-                  // agy's full trajectory holds: the calls are answered with
-                  // their real results, the step is cancelled, tools are
-                  // re-listed before the next session/prompt, and the next
-                  // prompt runs in the same live session.
+                  // A steer keeps the live session, so agy's prompt cache holds: the
+                  // calls are answered with their real results, the step is
+                  // cancelled, and the steer goes in as the next prompt.
+                  //
+                  // A tool the client declares only now (ToolSearch loaded it)
+                  // takes the same way. agy checks a call against the tools it
+                  // listed before the prompt began (#942), so the step is ended
+                  // there and the next prompt, in the same session, starts after
+                  // agy has listed the grown catalog (acquireProcLocked's
+                  // updateTools). Before, the session was dropped and the whole
+                  // history replayed into a new one with no cache, once per
+                  // ToolSearch load (plugins#1371, _paper_hands on X).
                   if (!prefillAfterResults && (interrupted || imageResult || toolsGrew) && historyMatches &&
                     sameInstructions(proc.instructions, instructions) &&
                     await proc.steerInSession(turn, rawResults, trailingMessages(body).history)) {
                     keptSession = true
-                    toolsGrewContinuation = toolsGrew
-                    if (toolsGrew) logBridgeEvent(proc, turn, "kept", "tools_grew", acquireOpts)
+                    if (toolsGrew) {
+                      if (!interrupted) grownTools = proc.grownToolNames(tools)
+                      logBridgeEvent(proc, turn, "kept", "tools_grew", acquireOpts)
+                    }
                     answeredIds = new Set(
                       rawResults
                         .filter((item) => !item.call.deferred || item.call.lateDelivered)
@@ -9320,6 +10332,10 @@ export const AntigravityBridgePlugin = async () => {
               }
 
               acquireOpts.unmatchedToolResults = resultBlocks.length > 0 && !keptSession
+              // results no live call waits for: a host that ended mid-loop
+              // left the session parked at this step (parkStep)
+              acquireOpts.resumeStep = !sideQuestion && resultBlocks.length > 0 && !keptSession && !acquireOpts.dropReason
+              if (acquireOpts.resumeStep) acquireOpts.stepCallsHash = stepCallHash(resultBlocks.map((block) => block.tool_use_id))
               const { proc, turn } = await acquireProc(
                 agy,
                 convKey,
@@ -9332,7 +10348,8 @@ export const AntigravityBridgePlugin = async () => {
             } catch (error) {
               return jsonError(error.statusCode ?? 502, error.message, error.code, { noRetry: error.noRetry })
             }
-          }),
+           })
+          },
         }
       },
     },
@@ -9353,7 +10370,12 @@ export const AntigravityBridgePlugin = async () => {
       // Not an OpenCode hook: the adapter in opencode2.mjs reads the list
       // once more when this background work ends.
       warming: () => catalogWarming(),
-      models: async (_given, ctx) => inAccount(await homeOfAuth(ctx?.auth), async () => {
+      models: async (_given, ctx) => {
+       const own = await ownOfAuth(ctx?.auth)
+       // agy's sign-in may be another account's: its list isn't this one's,
+       // and magpie keeps the list it had and shows why
+       if (own.refuse) throw new Error(own.refuse)
+       return inAccount(own.home, async () => {
         const agy = findAgy()
         // Never force a refresh here: Magpie times models() out after about two seconds.
         const catalog = await loadModelCatalog(agy, { probeOffered: true })
@@ -9389,8 +10411,10 @@ export const AntigravityBridgePlugin = async () => {
             } : {}),
           }
         }
+        out[IMAGE_MODEL_ID] = imageModelEntry(PROVIDER_ID)
         return out
-      }),
+       })
+      },
     },
   }
 }
@@ -9410,9 +10434,68 @@ function jsonError(status, message, code, { extra, headers, noRetry = false } = 
   )
 }
 
+// Shared failure classification for one-shot agy ACP sessions (image.mjs),
+// built from the same refusal, busy, credit and quota wording that index.mjs's
+// own turn handling uses.
+function classifyAgyFailure(detail) {
+  const text = String(detail ?? "")
+  if (!text) return null
+  const hasCore = (core) => text.includes(core) || text.includes(core.replace(/^⚠\s*/, ""))
+  if (/\b(?:authentication required|not (?:logged|signed) in|please (?:log|sign) in|invalid_grant)\b/i.test(text)) {
+    return {
+      status: 401,
+      message: "Antigravity is not signed in: sign in again in magpie, or run `agy` in a terminal",
+      headers: { "X-Magpie-Sign-In": "expired" },
+      signIn: "expired",
+      noRetry: true,
+    }
+  }
+  if (hasCore(DISABLED_CORE) || hasCore(AGENT_ERROR_CORES[4])) {
+    return { status: 403, message: ACCOUNT_DISABLED_REFUSED, noRetry: true }
+  }
+  if (hasCore(VERIFY_CORE) || /\bverification required\b/i.test(text)) {
+    return { status: 403, message: verifyRefused(verifyLinkIn(text)), noRetry: true }
+  }
+  const refused = agyRefusal(text)
+  if (refused) {
+    return { status: 403, message: refused, noRetry: true }
+  }
+  if (hasCore(CREDITS_CORE)) {
+    return {
+      status: 429,
+      message: "agy bridge: Antigravity AI credits balance is too low to continue",
+      noRetry: true,
+    }
+  }
+  if (hasCore(BUSY_CORE) || noCapacity(text) || /\bUNAVAILABLE\s*\(code 503\)|\bcode 503\b/i.test(text)) {
+    return {
+      status: 503,
+      message: "agy bridge: Antigravity has no capacity for this model now (503). Retry shortly.",
+      noRetry: false,
+    }
+  }
+  const quotaCore = QUOTA_CORES.find((core) => hasCore(core))
+  if (quotaCore || quotaReached(text) || QUOTA_DETAIL_RE.test(text) || /You have exhausted your capacity|quota will reset after/i.test(text)) {
+    const line = text.split(/\r?\n/).map((l) => l.trim()).find((l) =>
+      QUOTA_CORES.some((core) => l.includes(core) || l.includes(core.replace(/^⚠\s*/, ""))) ||
+      quotaReached(l) ||
+      /You have exhausted your capacity/i.test(l),
+    )
+    const resetMatch = /Resets in [0-9hms]+|Your quota will reset after [0-9hms]+/i.exec(text)?.[0]
+    const msg = line
+      ? `agy bridge: Antigravity quota reached: ${line}`
+      : resetMatch
+        ? `agy bridge: Antigravity quota or rate limit reached (${resetMatch})`
+        : "agy bridge: Antigravity quota or rate limit reached (429)"
+    return { status: 429, message: msg, noRetry: false }
+  }
+  return null
+}
+
 // On Windows child.kill() ends agy alone and leaves the cmd.exe and nc it
 // started, so one taskkill /T ends every tree before the workspaces go.
 function reapOnExit() {
+  reapOneshotChildren()
   const windows = process.platform === "win32"
   const pids = []
   for (const proc of allProcs) {

@@ -6,10 +6,11 @@
 - 用量按 agy 实际测得的上下文窗口计算。
 - 对话中途切换工作目录（如 Claude Code 执行裸 `cd` 导致 `x-magpie-work-dir` 变化）时，继续沿用原来的 agy 会话，不再销毁会话并截断历史。
 - SQLite 步级用量（`gen_metadata`）在同次生成拆出带文本/思考的后续工具响应、agy 内部压缩使 ACP 累计大于库内记录，或已验证可用库出现单轮瞬态回退时，不再永久关闭进程级读取；已回退估算时若 `end_turn` 窗口显著缩水则同步下调 `contextAnchor`。
-- 工具轮中 `ToolSearch` 动态新增工具（`tools_grew`）时，不再直接销毁活会话走 112 KiB 重放，而是通过 `steerInSession` 提交当前工具结果、取消当前 `session/prompt`、重新 `updateTools` 后在同一活会话内继续下一个 `session/prompt`。
 - `sessions.json` 持久化上限默认提高到 256（支持 `AGY_BRIDGE_MAX_PARKED`）并优先保留有状态对话，一次性/无状态请求（如后台摘要、记忆蒸馏）不挤占长会话的 `sessions.json` 与进程池 `evictLRU` 名额，且采用更短的空闲回收时间（`AGY_BRIDGE_EPHEMERAL_IDLE_MS`，默认 60s）。
 - Claude Code `/btw` 旁路提问自动隔离到独立临时会话（不写入 `sessions.json`、完成后立即回收），不再污染主会话 `expectedMessages` 或在主会话忙时触发 503。
 - 客户端在交付 `tool_result` 后、模型生成中途取消请求（HTTP 499）并丢弃半截回复继续发后续指令时，沿用已取消的原活会话，不再因残留 `tool_result` 触发 `forceNew` 强杀会话。
+
+上游自 `0.1.145` 起已原生支持 `ToolSearch` 动态新增工具时在同一会话提交结果、重新加载工具并继续。fork 保留了工具重新加载失败时回退的回归测试。
 
 ## 安装
 
