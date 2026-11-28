@@ -102,6 +102,14 @@ MCP server. The control port listens on loopback only, with a token per process.
   newer, because the ACP server has to advertise image support. An image a tool
   returns (a screenshot from `read`) goes to agy as a prompt image too: over MCP,
   agy would save it to a file the model can't open.
+- **Video and audio input** (Gemini models): inline base64. agy's ACP prompt
+  carries neither, so each is written to `attachments/<sha256>.<ext>` in the
+  session's folder and the model is asked to read it with agy's own
+  `view_file`, which hands Gemini the frames and the sound. Only a
+  conversation that carries one gets `view_file`; agy's tools stay off
+  otherwise. A video or audio URL, or one sent to a model other than Gemini,
+  gets HTTP 400. `count_tokens` counts a video or audio clip as one image, so
+  a long clip is undercounted.
 - **Tool calls**: parallel and consecutive calls both work. A tool that runs past
   150 seconds first gets a "still running" placeholder; once the real result
   arrives, the same turn continues, and the client executes each call exactly once.
@@ -298,7 +306,17 @@ its quota, agy reads on, and the next refresh shows what it read without
 running agy again. A read that doesn't finish in 45 seconds says so, names a
 slow network or proxy as the usual cause, and is tried again a minute later.
 When agy refuses `/usage` for the account's region ("not currently available
-in your location"), the account shows agy's refusal and no numbers.
+in your location"), the plugin asks agy acp which tier it serves the account
+on. Google can name a tier the account can't have (the free one, in a region
+it isn't offered in) beside the paid one it is served on, and agy's print
+mode and `agy models` refuse on that alone while agy's ACP server and its
+terminal UI serve the account. With a tier, the plugin starts agy's terminal
+UI in a terminal of its own, with a status line for that run only
+(`--settings`, never saved), takes the quota agy hands the status line, and
+stops agy; nothing is typed into it and no prompt is sent. The model list
+then comes from what agy acp offers (plugins#1602). With no tier, the
+account shows agy's refusal and no numbers. On Windows, where the plugin has
+no terminal to give agy, the refusal stays.
 
 While Antigravity's app has its gateway on (`gateway.enabled` in
 `~/.gemini/config/config.json`, as when magpie takes over Antigravity), agy
@@ -403,7 +421,11 @@ since 11-14 Google's check reads past them. Reworded in the first user turn
 (the default), Claude Code's prompt is answered; in agy's session
 instructions (`AGY_BRIDGE_SYSTEM_APPEND=1`) it is still turned away. So a
 bare 429 there is reported as a 400 about the prompt, and in the user turn
-as a rate limit the client can retry or another account can take.
+as a rate limit the client can retry or another account can take. Either
+way it ends the turn on the first try that got it: since agy 1.5.13 retries
+it silently for minutes (eight tries over about two and a half), writing it
+only to its log, so the plugin reads that log while the prompt runs instead
+of waiting for agy to give up.
 
 DeepSeek Harness's paragraph on `@` paths ("Tokens prefixed with @ are
 paths…") goes reworded with the same meaning, as the Antigravity provider

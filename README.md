@@ -69,6 +69,11 @@ agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy
 - **图片输入**：支持内联 base64 的 PNG、JPEG、GIF、WebP。需要 agy 1.5.0 或更新版本，
   因为图片能力要由 ACP 服务端声明。工具返回的图片（如 `read` 读到的截图）也作为提示里的
   图片交给 agy：走 MCP 的话，agy 会把它存成文件，模型看不到。
+- **视频与音频输入**（Gemini 型号）：支持内联 base64。agy 的 ACP 提示带不了这两种，所以
+  每个都写到会话目录的 `attachments/<sha256>.<扩展名>`，再请模型用 agy 自己的 `view_file`
+  读取，Gemini 由此拿到画面和声音。只有带着视频或音频的对话才有 `view_file`，其余时候
+  agy 的工具都关着。视频或音频给的是 URL，或发给 Gemini 以外的模型时，返回 HTTP 400。
+  `count_tokens` 把一段视频或音频按一张图片计数，长片段会少算。
 - **工具调用**：支持并行和连续调用。运行超过 150 秒的工具会先收到 "still running" 的
   占位响应，真正的结果送达后继续同一轮对话，每个调用只在客户端执行一次。
 - **会话续接**：每轮结束后记录会话，工具循环进行中的每一步也记录。重启 Magpie 或插件后，
@@ -207,8 +212,13 @@ agy 存的登录令牌去直接请求 Google 的额度接口，也不替 agy 续
 冷启动、Windows、新加的账号或网络/代理慢时更久，所以插件给它 45 秒。Magpie 一次只等 20 秒：
 超过时账号显示「agy 还在读这个账号的额度」，agy 接着读完，下次刷新直接显示结果，不再运行一次 agy。
 45 秒内仍没读完时，账号说明 agy 自己的读取没在 45 秒内完成、通常是网络或代理慢，一分钟后再试。
-agy 因地区拒绝 `/usage`（"not currently available in your location"）时，账号显示 agy 的拒绝原因，
-不显示数字。
+agy 因地区拒绝 `/usage`（"not currently available in your location"）时，插件先问 agy acp
+这个账号在哪个档位上服务。Google 可能在账号实际用的付费档位旁边，再列一个它用不了的档位（未开放地区的
+免费档位）；agy 的打印模式和 `agy models` 只因这一条就拒绝，agy 的 ACP 和终端界面却照常服务这个账号。
+有档位时，插件在自己的终端里启动 agy 的终端界面，带一个只用于这一次的状态栏（`--settings`，不保存），
+取 agy 交给状态栏的额度后关掉 agy；不往里输入任何东西，也不发提示词。型号列表这时用 agy acp 开放的型号
+（plugins#1602）。没有档位时，账号显示 agy 的拒绝原因，不显示数字。Windows 上插件没有终端可给 agy，
+仍显示拒绝。
 
 Antigravity 应用的网关打开时（`~/.gemini/config/config.json` 里 `gateway.enabled`，例如 Magpie
 接管了 Antigravity），agy 读同一个文件，会走网关而不是你的 Google 账号，`/usage` 只得到
@@ -282,7 +292,8 @@ Antigravity 对几行系统提示词（Claude Code 的计费行、Claude Agent S
 和 pi 的身份句、oh-my-pi 的 RFC 2119 行）不论余量多少都回 429 "Resource has been exhausted"。插件在
 agy 发出之前去掉计费那一行，其余几行换成同义的说法（"built on the Claude Agent SDK by Anthropic"、"built on GPT-5"、"RFC 2119 key words: …"、"You're Hermes Agent / OpenCode / a coding agent running in the Codex CLI"、"running within pi"），和 Antigravity 提供商的做法一样（`cloak.mjs`）。Codex 的两句 GPT-5 行（"You are Codex, a coding agent based on GPT-5"、"You are Codex, an agent based on GPT-5"）出现在用户的轮次里（AGENTS.md、`<system-reminder>`）也会被拒，所以用户轮次里也换成 "built on GPT-5"。零宽空格已经没用：11-14 起 Google 的检查会忽略它们。改写后放在第一条用户消息里（默认做法），Claude Code
 的提示词能正常回答；放在 agy 的会话指令里（`AGY_BRIDGE_SYSTEM_APPEND=1`）仍然被拒。所以后者回的 429 报成针对
-提示词的 400，前者报成限流，客户端可以重试，或交给别的账号。
+提示词的 400，前者报成限流，客户端可以重试，或交给别的账号。两种情况都在第一次被拒时就结束本轮：agy 1.5.13
+起会静默重试几分钟（约两分半内 8 次），只写在它的日志里，所以插件在提示词运行期间读这份日志，不再等 agy 放弃。
 
 DeepSeek Harness 的 `@` 路径说明段（"Tokens prefixed with @ are paths…"）也和 Antigravity 提供商一样
 换成同义的说法再发：原文照发时 `gemini-4-argon` 大多很快答完、不思考、只走一步（#1028）。
